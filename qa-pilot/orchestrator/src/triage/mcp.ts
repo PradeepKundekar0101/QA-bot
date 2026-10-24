@@ -57,12 +57,19 @@ export function triageServer(deps: TriageDeps): McpServer {
   return server;
 }
 
-/** Whether the request carries the agent's bearer token. Constant-time, and false whenever no token is configured. */
-export function agentAuthorized(header: string | undefined, token: string | undefined): boolean {
+/**
+ * Whether the request carries the agent's token, as `Authorization: Bearer <token>` or as
+ * `X-API-Key: <token>` (agent platforms that store it as an API key send it that way).
+ * Constant-time, and false whenever no token is configured.
+ */
+export function agentAuthorized(headers: { authorization?: string; apiKey?: string }, token: string | undefined): boolean {
   if (!token) return false;
-  const given = Buffer.from(header?.replace(/^Bearer\s+/i, "") ?? "");
   const want = Buffer.from(token);
-  return given.length === want.length && timingSafeEqual(given, want);
+  const matches = (value: string | undefined) => {
+    const given = Buffer.from(value ?? "");
+    return given.length === want.length && timingSafeEqual(given, want);
+  };
+  return matches(headers.authorization?.replace(/^Bearer\s+/i, "")) || matches(headers.apiKey);
 }
 
 export async function handleMcp(req: Request, deps: TriageDeps): Promise<Response> {

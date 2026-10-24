@@ -64,6 +64,17 @@ describe("triage agent MCP endpoint", () => {
     expect((await call(app, "tools/list", {}, "wrong-token-of-same-len")).status).toBe(401);
   });
 
+  it("accepts the token as an X-API-Key header too", async () => {
+    const app = createApi({ store, start: () => ({ runId: "x" }), trackers, agentToken: TOKEN });
+    const res = await app.request(`${ORIGIN}/mcp`, {
+      method: "POST",
+      headers: { "x-api-key": TOKEN, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    expect(res.status).toBe(200);
+    expect((await app.request(`${ORIGIN}/mcp`, { method: "POST", headers: { "x-api-key": "wrong-token-of-same-len" }, body: "{}" })).status).toBe(401);
+  });
+
   it("lists its tools", async () => {
     const app = createApi({ store, start: () => ({ runId: "x" }), trackers, agentToken: TOKEN });
     const { body } = await call(app, "tools/list", {});

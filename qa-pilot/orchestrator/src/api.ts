@@ -232,7 +232,7 @@ export function createApi(opts: {
   app.all("/mcp", async (c) => {
     const token = opts.agentToken ?? process.env.QA_PILOT_AGENT_TOKEN;
     if (!token) return c.json({ error: "the triage agent endpoint is not configured" }, 503);
-    if (!agentAuthorized(c.req.header("authorization"), token)) return c.json({ error: "unauthorized" }, 401);
+    if (!agentAuthorized({ authorization: c.req.header("authorization"), apiKey: c.req.header("x-api-key") }, token)) return c.json({ error: "unauthorized" }, 401);
     return handleMcp(c.req.raw, triageDeps);
   });
 
