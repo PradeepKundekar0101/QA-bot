@@ -139,6 +139,23 @@ describe("starting the AgenticOrg triage agent", () => {
     expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "ok", detail: { taskId: "run_42", status: "completed", draft: "Hi, qa-pilot found 1 likely bug: the coupon endpoint returned 500." } }]);
   });
 
+  it("retries once when the connection fails, but not when AgenticOrg answers with an error", async () => {
+    let calls = 0;
+    const flaky = (async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+      return new Response(JSON.stringify({ run_id: "run_7", status: "completed", output: { raw_output: "draft" } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await triageHandoff(store, "x", { baseUrl: "https://a", apiKey: "k", agentId: "a" }, flaky, 0)("tr-1", defects);
+    expect(calls).toBe(2);
+    expect(readTriageLog("tr-1")).toMatchObject([{ outcome: "ok", detail: { draft: "draft" } }]);
+
+    calls = 0;
+    const refusing = (async () => { calls++; return new Response("bad key", { status: 401 }); }) as unknown as typeof fetch;
+    await expect(triageHandoff(store, "x", { baseUrl: "https://a", apiKey: "k", agentId: "a" }, refusing, 0)("tr-1", defects)).rejects.toThrow(/401/);
+    expect(calls).toBe(1);
+  });
+
   it("logs that the owner decides in the app when AgenticOrg is not configured", async () => {
     await triageHandoff(store, "https://app.qa-pilot.test", null)("tr-1", defects);
     expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "refused" }]);
@@ -159,5 +176,13 @@ describe("draftFrom", () => {
     expect(draftFrom({ result: { output: { message: "nested" } } })).toBe("nested");
     expect(draftFrom({ status: "hitl_triggered" })).toBeNull();
     expect(draftFrom({ output: { raw_output: "   " } })).toBeNull();
+  });
+});
+
+describe("describeError", () => {
+  it("adds a fetch failure's cause, which is the part that says why", async () => {
+    const { describeError } = await import("../src/triage/agenticorg.js");
+    expect(describeError(Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_HEADERS_TIMEOUT" } }))).toBe("fetch failed (UND_ERR_HEADERS_TIMEOUT)");
+    expect(describeError(new Error("AgenticOrg answered 500: x"))).toBe("AgenticOrg answered 500: x");
   });
 });

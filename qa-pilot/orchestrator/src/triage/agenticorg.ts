@@ -104,11 +104,18 @@ export async function startTriageTask(cfg: AgenticOrgConfig, task: TriageTask, f
   }
 }
 
+/** A fetch failure's message plus its cause, which is where Node puts the part that says why (DNS, reset, timeout). */
+export function describeError(err: unknown): string {
+  const e = err as Error & { cause?: { code?: string; message?: string } };
+  const cause = e.cause?.code ?? e.cause?.message;
+  return cause && !e.message.includes(cause) ? `${e.message} (${cause})` : e.message;
+}
+
 /**
  * The `onCandidates` hook `startRun` calls when a run pauses for confirmation. With AgenticOrg
  * unconfigured the run simply waits for the owner in the UI, and the log says so.
  */
-export function triageHandoff(store: Store, uiOrigin: string, cfg: AgenticOrgConfig | null = agenticOrgFromEnv(), fetchImpl: typeof fetch = fetch) {
+export function triageHandoff(store: Store, uiOrigin: string, cfg: AgenticOrgConfig | null = agenticOrgFromEnv(), fetchImpl: typeof fetch = fetch, retryDelayMs = 3000) {
   return async (runId: string, defects: Defect[]): Promise<void> => {
     const run = await store.getRun(runId);
     if (!run) return;
@@ -119,10 +126,16 @@ export function triageHandoff(store: Store, uiOrigin: string, cfg: AgenticOrgCon
     const owner = await store.findUserById(run.userId);
     const task = triageTask(runId, run.url, owner?.email ?? null, defects, uiOrigin);
     try {
-      const { taskId, status, draft } = await startTriageTask(cfg, task, fetchImpl);
+      // One retry for a dropped connection; an error AgenticOrg answered with is not retried.
+      const once = () => startTriageTask(cfg, task, fetchImpl);
+      const { taskId, status, draft } = await once().catch(async (err: Error) => {
+        if (!(err instanceof TypeError)) throw err;
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+        return once();
+      });
       logTriage(runId, { tool: "start_triage_agent", input: { candidates: defects.map((d) => d.id) }, outcome: status === "failed" ? "error" : "ok", detail: { taskId, status, draft } });
     } catch (err) {
-      logTriage(runId, { tool: "start_triage_agent", input: { candidates: defects.map((d) => d.id) }, outcome: "error", detail: (err as Error).message });
+      logTriage(runId, { tool: "start_triage_agent", input: { candidates: defects.map((d) => d.id) }, outcome: "error", detail: describeError(err) });
       throw err;
     }
   };
