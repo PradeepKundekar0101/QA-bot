@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { LlmClient } from "../llm/client.js";
 import type { ChatMessage, RunDraft } from "../store/types.js";
-import { DEFAULT_MAX_FLOWS } from "../state.js";
 
 /**
  * How many transcript messages the model sees. The draft carries the accumulated state, so
@@ -24,9 +23,6 @@ const PatchSchema = z.object({
   url: z.string().optional(),
   intent: z.string().optional(),
   requiresSignIn: z.boolean().optional(),
-  maxFlows: z.number().optional(),
-  budget: z.object({ maxLlmCalls: z.number().optional(), maxMinutes: z.number().optional() }).optional(),
-  reviewPlan: z.boolean().optional(),
 });
 
 export const ChatTurnSchema = z.object({
@@ -53,16 +49,7 @@ export const RunDraftSchema = z.object({
   prdText: z.string().optional(),
   prdName: z.string().optional(),
   requiresSignIn: z.boolean().optional(),
-  maxFlows: z.number().int().positive().optional(),
-  budget: z.object({ maxLlmCalls: z.number().int().positive().optional(), maxMinutes: z.number().int().positive().optional() }).optional(),
-  reviewPlan: z.boolean().optional(),
 });
-
-function positiveInt(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  const floored = Math.floor(value);
-  return floored >= 1 ? floored : undefined;
-}
 
 /**
  * A bare host is what people type and what a model tends to echo back, but the form's
@@ -106,20 +93,6 @@ export function normalisePatch(raw: unknown): RunDraft {
   if (intent) out.intent = intent;
 
   if (typeof p.requiresSignIn === "boolean") out.requiresSignIn = p.requiresSignIn;
-  if (typeof p.reviewPlan === "boolean") out.reviewPlan = p.reviewPlan;
-
-  const maxFlows = positiveInt(p.maxFlows);
-  if (maxFlows !== undefined) out.maxFlows = maxFlows;
-
-  if (p.budget && typeof p.budget === "object") {
-    const b = p.budget as Record<string, unknown>;
-    const maxLlmCalls = positiveInt(b.maxLlmCalls);
-    const maxMinutes = positiveInt(b.maxMinutes);
-    const budget: NonNullable<RunDraft["budget"]> = {};
-    if (maxLlmCalls !== undefined) budget.maxLlmCalls = maxLlmCalls;
-    if (maxMinutes !== undefined) budget.maxMinutes = maxMinutes;
-    if (Object.keys(budget).length > 0) out.budget = budget;
-  }
 
   return out;
 }
@@ -143,9 +116,6 @@ export function turnInput(args: { draft: RunDraft; messages: ChatMessage[]; need
     `intent: ${d.intent ?? "(empty)"}`,
     `prd: ${prdLine(d)}`,
     `requiresSignIn: ${d.requiresSignIn ?? false}`,
-    `reviewPlan: ${d.reviewPlan ?? false}`,
-    `maxFlows: ${d.maxFlows ?? DEFAULT_MAX_FLOWS}`,
-    `budget: ${d.budget?.maxLlmCalls ?? 200} LLM calls, ${d.budget?.maxMinutes ?? 40} minutes`,
     "",
     "CONVERSATION",
   ];

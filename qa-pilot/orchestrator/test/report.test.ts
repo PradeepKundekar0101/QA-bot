@@ -36,6 +36,17 @@ describe("renderReport", () => {
     expect(md).toContain("R1 login");
   });
 
+  it("shows each candidate defect's ruling and counts only confirmed ones as defects", () => {
+    const s = sample();
+    s.defects.push({ ...s.defects[0], id: "DEF-2", flow: "checkout-004", confidence: 0.55, needsLook: true });
+    const md = renderReport(s, [{ defectId: "DEF-1", verdict: "confirmed", by: "owner", at: "2026-10-24T10:00:00.000Z" }]);
+    expect(md).toContain("| Candidate defects | Confirmed defects |");
+    expect(md).toMatch(/\| 2 \| 1 \|/);
+    expect(md).toContain("Status: confirmed.");
+    expect(md).toContain("Status: awaiting confirmation (needs a look: low confidence).");
+    expect(renderReport(s, [{ defectId: "DEF-2", verdict: "script", by: "agent", at: "2026-10-24T10:00:00.000Z" }])).toContain("Status: ruled a script bug.");
+  });
+
   it("labels a partial run with the actual reason it stopped", () => {
     const s = sample();
     const md = renderReport({ ...s, partial: true, partialReason: "plan failed: boom" });

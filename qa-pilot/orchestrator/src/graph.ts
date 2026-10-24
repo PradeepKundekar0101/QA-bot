@@ -17,6 +17,9 @@ type NodeFn = (state: RunState, deps: NodeDeps) => Promise<RunUpdate>;
 /** The node the graph pauses in front of when a run asked for its plan to be reviewed. */
 export const REVIEW_NODE = "review";
 
+/** The node the graph pauses in front of while a person rules on each candidate defect. */
+export const CONFIRM_NODE = "await_defect_confirmation";
+
 export function buildGraph(deps: NodeDeps, opts: { checkpointPath?: string } = {}) {
   /** Skips the node and marks the run partial when the budget is gone. */
   const guarded = (name: string, fn: NodeFn) => async (state: RunState): Promise<RunUpdate> => {
@@ -45,6 +48,8 @@ export function buildGraph(deps: NodeDeps, opts: { checkpointPath?: string } = {
    * the edge after it can fan out to generation. Runs without review never route here.
    */
   const review = async (): Promise<RunUpdate> => ({});
+  /** Same shape as `review`: a place for the interrupt to stand. `startRun` resumes past it once every candidate defect has a verdict. */
+  const confirm = async (): Promise<RunUpdate> => ({});
 
   const prepareRerun = async (state: RunState): Promise<RunUpdate> => {
     const ids = state.classifications.filter((c) => c.action === "rerun").map((c) => c.test);
@@ -62,6 +67,7 @@ export function buildGraph(deps: NodeDeps, opts: { checkpointPath?: string } = {
     .addNode("evaluate_coverage", guarded("evaluate_coverage", coverageNode))
     .addNode("generateFlow", guarded("generate", generateFlowNode))
     .addNode(REVIEW_NODE, review)
+    .addNode(CONFIRM_NODE, confirm)
     .addNode("run", guarded("run", runNode))
     .addNode("classify", guarded("classify", classifyNode))
     .addNode("prepareRerun", prepareRerun)
@@ -97,8 +103,9 @@ export function buildGraph(deps: NodeDeps, opts: { checkpointPath?: string } = {
     .addConditionalEdges("classify", (state: RunState): string => {
       if (state.partial) return "report";
       const next = afterClassify(state, deps);
-      return next === "rerun" ? "prepareRerun" : next;
-    }, ["heal", "prepareRerun", "report"])
+      return next === "rerun" ? "prepareRerun" : next === "confirm" ? CONFIRM_NODE : next;
+    }, ["heal", "prepareRerun", CONFIRM_NODE, "report"])
+    .addEdge(CONFIRM_NODE, "report")
     .addEdge("prepareRerun", "run")
     .addConditionalEdges("heal", (state: RunState): string => (state.partial ? "report" : afterHeal(state, deps)), ["run", "report"])
     .addEdge("report", END);
@@ -106,7 +113,7 @@ export function buildGraph(deps: NodeDeps, opts: { checkpointPath?: string } = {
   const checkpointer = SqliteSaver.fromConnString(opts.checkpointPath ?? ":memory:");
   // The interrupt only fires when the graph actually routes to the review node, which
   // happens solely for runs that asked for it; every other run is unaffected.
-  return graph.compile({ checkpointer, interruptBefore: [REVIEW_NODE] });
+  return graph.compile({ checkpointer, interruptBefore: [REVIEW_NODE, CONFIRM_NODE] });
 }
 
 export type CompiledGraph = ReturnType<typeof buildGraph>;

@@ -1,7 +1,7 @@
 "use client";
 import { useMemo, useState } from "react";
 import { Button, Icon, Spinner } from "@/components/ui";
-import { submitReview } from "@/lib/api";
+import { addReviewFlow, submitReview } from "@/lib/api";
 import { useRun } from "@/lib/run-context";
 import { describeFlow, expectationLabel, stepLabel, areaOf, PRIORITY_LABEL, PRIORITY_ORDER, type Flow, type Priority } from "@/lib/cases";
 
@@ -10,10 +10,19 @@ import { describeFlow, expectationLabel, stepLabel, areaOf, PRIORITY_LABEL, PRIO
  * review gate: every proposed flow can be renamed, re-prioritised or deselected, and
  * nothing is generated until the reviewer confirms. Flows are edited as local drafts; the
  * submitted plan is what the generator sees, and plan.json is rewritten to match.
+ *
+ * A flow can also be asked for in plain words. The planner writes it against the run's own
+ * site map and walks it on the live app before it comes back, so what lands in the list is a
+ * flow that can actually run; it is ticked like the rest and goes in only if it stays ticked.
  */
 export function ReviewModal() {
-  const { runId, plan } = useRun();
-  const flows = useMemo(() => plan ?? [], [plan]);
+  const { runId, plan, run } = useRun();
+  const cap = run?.maxFlows ?? null;
+  const [added, setAdded] = useState<Flow[]>([]);
+  const flows = useMemo(() => [...(plan ?? []), ...added], [plan, added]);
+  const [request, setRequest] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Flow>>({});
   const [deselected, setDeselected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -29,6 +38,7 @@ export function ReviewModal() {
   }, [flows]);
   const shown = useCase ? flows.filter((f) => areaOf(f.id) === useCase) : flows;
   const selectedCount = flows.length - deselected.size;
+  const overCap = cap !== null && selectedCount > cap;
   const allShownSelected = shown.every((f) => !deselected.has(f.id));
 
   const toggleAll = () => setDeselected((prev) => {
@@ -39,6 +49,24 @@ export function ReviewModal() {
   const toggle = (id: string) => setDeselected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const edit = (f: Flow, patch: Partial<Flow>) => setDrafts((prev) => ({ ...prev, [f.id]: { ...current(f), ...patch } }));
   const flip = (id: string) => setExpanded((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+
+  async function addFlow(e: React.FormEvent) {
+    e.preventDefault();
+    const text = request.trim();
+    if (!text) return;
+    setAdding(true);
+    setAddError(null);
+    try {
+      const flow = (await addReviewFlow(runId, text)) as Flow;
+      setAdded((prev) => [...prev, flow]);
+      setRequest("");
+      setUseCase(null);
+    } catch (err) {
+      setAddError((err as Error).message);
+    } finally {
+      setAdding(false);
+    }
+  }
 
   async function confirm() {
     setBusy(true);
@@ -85,6 +113,22 @@ export function ReviewModal() {
             horizontal scroll is what every other table in the app does.
           */}
           <div className="overflow-auto p-4">
+            <form onSubmit={addFlow} className="mb-4 rounded-box border border-line bg-inset p-3">
+              <label htmlFor="add-flow" className="text-[12.5px] font-medium tracking-[0.2px] text-fg">Add a flow in plain words</label>
+              <div className="mt-2 flex gap-2">
+                <input
+                  id="add-flow" value={request} onChange={(e) => setRequest(e.target.value)} disabled={adding} maxLength={500}
+                  placeholder="for example: apply an expired coupon at checkout and expect an error"
+                  className="h-9 min-w-0 flex-1 rounded-input border border-line bg-surface px-3 text-[13px] text-fg placeholder:text-subtle focus:border-line-strong focus:outline-none disabled:opacity-60"
+                />
+                <Button type="submit" variant="outline" disabled={adding || request.trim().length < 3}>
+                  {adding ? <><Spinner /> Planning</> : <><Icon name="plus" size={13} /> Add</>}
+                </Button>
+              </div>
+              <p className={`mt-1.5 text-[12px] leading-relaxed ${addError ? "text-fail" : "text-muted"}`} role={addError ? "alert" : undefined}>
+                {addError ?? (adding ? "Writing the flow and walking it on the live app. This takes up to a minute." : "The planner checks it against the live app before it joins the list.")}
+              </p>
+            </form>
             {flows.length === 0 ? <div className="flex justify-center p-10"><Spinner size={20} /></div> : (
               <table className="w-full min-w-[46rem] border-collapse text-sm">
                 <thead>
@@ -111,7 +155,7 @@ export function ReviewModal() {
                           </select>
                         </td>
                         <td className="px-2 py-2">
-                          <textarea value={f.title} onChange={(e) => edit(raw, { title: e.target.value })} rows={3} aria-label="Test name" className="w-full resize-none rounded-input border border-line bg-inset px-2 py-1.5 text-[13px] leading-relaxed text-fg focus:border-line-strong focus:outline-none" />
+                          <textarea value={f.title} onChange={(e) => edit(raw, { title: e.target.value })} rows={3} aria-label="Test name" className="w-full resize-none [field-sizing:content] rounded-input border border-line bg-inset px-2 py-1.5 text-[13px] leading-relaxed text-fg focus:border-line-strong focus:outline-none" />
                           <button onClick={() => flip(f.id)} aria-expanded={open} className="mt-1.5 inline-flex items-center gap-1 text-[11.5px] font-medium text-muted transition-colors hover:text-fg">
                             <Icon name="chevronRight" size={11} className={`transition-transform ${open ? "rotate-90" : ""}`} />
                             {open ? "Hide flow" : "Show flow"}
@@ -144,11 +188,12 @@ export function ReviewModal() {
 
         <footer className="flex flex-wrap items-center justify-between gap-4 border-t border-line px-6 py-3.5">
           <p className="text-[12.5px] leading-relaxed text-muted">
-            <span className="font-mono text-fg">{selectedCount}</span> of {flows.length} selected. Deselected flows are dropped from this run; the report lists them as untested.
+            <span className={`font-mono ${overCap ? "text-fail" : "text-fg"}`}>{selectedCount}</span> of {flows.length} selected{cap !== null ? `, up to ${cap} for this run` : ""}.{" "}
+            {overCap ? `Untick ${selectedCount - cap!} to continue.` : "Deselected flows are dropped from this run; the report lists them as untested."}
           </p>
           <div className="flex items-center gap-3">
             {error && <p role="alert" className="flex items-center gap-1.5 text-[13px] text-fail"><Icon name="alert" size={14} /> {error}</p>}
-            <Button onClick={confirm} disabled={busy || flows.length === 0}>
+            <Button onClick={confirm} disabled={busy || flows.length === 0 || selectedCount === 0 || overCap}>
               {busy ? <><Spinner /> Starting</> : <><Icon name="play" size={13} /> Run {selectedCount === flows.length ? "all" : selectedCount}</>}
             </Button>
           </div>

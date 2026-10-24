@@ -3,7 +3,7 @@ import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startShop } from "./helpers/shop.js";
-import { startRun, awaitingReview, submitReview } from "../src/run.js";
+import { startRun, awaitingReview, submitReview, awaitingConfirmation, submitVerdicts, reviewFlowCap } from "../src/run.js";
 import { buildGraph } from "../src/graph.js";
 import { EventBus, getBus } from "../src/events.js";
 import { FakeLlmClient } from "../src/llm/client.js";
@@ -41,11 +41,29 @@ describe("full graph against mini-shop with the fake LLM", () => {
       "classify-rationale": { rationale: "Server returned 500 on the coupon endpoint.", confidence_adjustment: 0 },
       heal: { role: "button", name: "Apply coupon", reason: "unchanged", confidence: 0.2 },
     });
+    const store = memoryStore();
+    const handedOff: string[][] = [];
     const { runId, done } = await startRun(
       { runId: "it-1", userId: "u-test", url: shop.base, credentials: { username: "demo@shop.test", password: "demo1234" }, intent: "login and checkout coupon", maxFlows: 12, budget: { maxLlmCalls: 200, maxMinutes: 40 } },
-      { headless: true, llm, store: memoryStore() },
+      { headless: true, llm, store, onCandidates: async (_id, defects) => { handedOff.push(defects.map((d) => d.flow)); } },
     );
+
+    // The run holds its candidate defects for a person before writing the report.
+    const deadline = Date.now() + 240_000;
+    while (!awaitingConfirmation(runId) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    expect(awaitingConfirmation(runId)).toBe(true);
+    expect((await store.getRun(runId))!.status).toBe("awaiting_confirmation");
+    expect(handedOff).toEqual([["checkout-001"]]);
+    const candidates = JSON.parse(readFileSync(outputDir(runId) + "defects.json", "utf8")) as Array<{ id: string; flow: string; confidence: number; needsLook: boolean }>;
+    expect(candidates.map((d) => d.flow)).toEqual(["checkout-001"]);
+    expect(candidates[0].confidence).toBeGreaterThanOrEqual(0.8);
+    expect(candidates[0].needsLook).toBe(false);
+    expect((candidates[0] as { screenshot?: string }).screenshot).toMatch(/traces\/classify\/.*failure-checkout-001\.png$/);
+    expect(existsSync(outputDir(runId) + "report.md")).toBe(false);
+    expect(submitVerdicts(runId, [{ defectId: candidates[0].id, verdict: "confirmed" }], "owner")).toMatchObject({ undecided: [], resumed: true });
+
     const final = await done;
+    expect((await store.getRun(runId))!.status).toBe("done");
     await fetch(shop.base + "/__chaos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ breakCoupon: false }) });
     const dir = process.env.QA_PILOT_OUTPUT + runId + "/";
     for (const f of ["plan.md", "plan.json", "coverage.json", "results.json", "heal-log.json", "defects.json", "report.md", "report.html", "decisions.jsonl", "events.jsonl", "login-steps.json"]) expect(existsSync(dir + f), f).toBe(true);
@@ -60,7 +78,8 @@ describe("full graph against mini-shop with the fake LLM", () => {
     expect(coupon?.confidence).toBeGreaterThanOrEqual(0.8);
     expect(final.defects.map((d) => d.flow)).toContain("checkout-001");
     const decisions = readFileSync(dir + "decisions.jsonl", "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(decisions.map((d) => d.node)).toEqual(expect.arrayContaining(["explore", "evaluate_coverage", "classify"]));
+    expect(decisions.map((d) => d.node)).toEqual(expect.arrayContaining(["explore", "evaluate_coverage", "classify", "await_defect_confirmation"]));
+    expect(decisions.find((d) => d.node === "await_defect_confirmation")?.reason).toBe("1 of 1 candidate defect(s) confirmed");
   }, 300_000);
 });
 
@@ -103,6 +122,7 @@ describe("plan review gate", () => {
     expect(events.some((e) => e.type === "node_start" && e.node === "review")).toBe(true);
     expect(events.some((e) => e.type === "node_start" && e.node === "generate")).toBe(false);
 
+    expect(reviewFlowCap(runId)).toBe(3);
     const kept = flows.filter((f) => f.id === "auth-001" || f.id === "orders-authz-001");
     expect(submitReview(runId, kept)).toBe(true);
     expect(submitReview(runId, kept)).toBe(false);

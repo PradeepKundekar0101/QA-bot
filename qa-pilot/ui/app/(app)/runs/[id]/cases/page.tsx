@@ -8,7 +8,7 @@ import { StatusChips } from "@/components/cases/StatusChips";
 import { SearchBox } from "@/components/cases/SearchBox";
 import { NextStageCta } from "@/components/stage/NextStageCta";
 import { StageWaiting } from "@/components/stage/StageWaiting";
-import { rerunTest } from "@/lib/api";
+import { isInFlight, rerunTest } from "@/lib/api";
 import { useRun } from "@/lib/run-context";
 import { filterRows, statusCounts, type CaseStatus, type TestResultData } from "@/lib/cases";
 
@@ -24,7 +24,7 @@ export default function CasesPage() {
   const counts = useMemo(() => statusCounts(rows), [rows]);
   const shown = useMemo(() => filterRows(rows, { status, query }), [rows, status, query]);
   const crumbs = [{ label: "Runs", href: "/" }, { label: runId, href: `/runs/${encodeURIComponent(runId)}` }, { label: "Test cases" }];
-  const finished = run !== null && run.status !== "running" && run.status !== "awaiting_review";
+  const finished = run !== null && !isInFlight(run.status);
   const rerunnable = rows.filter((r) => r.status !== "planned");
 
   /** Re-executes every generated test, one at a time so the live preview follows along. */

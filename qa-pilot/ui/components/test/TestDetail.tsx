@@ -5,7 +5,7 @@ import { PriorityTag } from "@/components/cases/PriorityTag";
 import { LivePreview } from "./LivePreview";
 import { RecordingPlayer } from "./RecordingPlayer";
 import { CodeView } from "./CodeView";
-import { fileUrl, rerunTest } from "@/lib/api";
+import { fileUrl, isInFlight, rerunTest } from "@/lib/api";
 import { useRun } from "@/lib/run-context";
 import { formatDuration, relativeTime } from "@/lib/format";
 import {
@@ -114,7 +114,7 @@ function Detail({ row, onClose }: { row: CaseRow; onClose: () => void }) {
 
   const { flow } = row;
   const states = stepStates(flow, row);
-  const runFinished = run !== null && run.status !== "running" && run.status !== "awaiting_review";
+  const runFinished = run !== null && !isInFlight(run.status);
   const trace = artifactRel(row.result?.tracePath, runId);
   const codeVersion = events.filter((e) => e.type === "node_end" && (e.node === "heal" || e.node === "generate")).length;
 

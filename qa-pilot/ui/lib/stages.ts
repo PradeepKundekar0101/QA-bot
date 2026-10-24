@@ -1,6 +1,6 @@
 import { isDone, pipelineState, type NodeName } from "./derive";
 import type { RunEvent } from "./events";
-import type { RunStatus } from "./api";
+import { isInFlight, type RunStatus } from "./api";
 import type { IconName } from "@/components/ui";
 
 /*
@@ -61,7 +61,7 @@ const DEFINITIONS: Record<StageId, Omit<Stage, "status">> = {
  */
 export function stages(events: RunEvent[], status?: RunStatus): Stage[] {
   const nodes = new Map(pipelineState(events).map((n) => [n.node, n]));
-  const over = isDone(events) || (status !== undefined && status !== "running" && status !== "awaiting_review");
+  const over = isDone(events) || (status !== undefined && !isInFlight(status));
   return STAGE_ORDER.map((id) => {
     const def = DEFINITIONS[id];
     const own = def.nodes.map((n) => nodes.get(n)!);

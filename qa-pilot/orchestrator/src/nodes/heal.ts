@@ -87,7 +87,7 @@ export async function healNode(state: RunState, deps: NodeDeps): Promise<RunUpda
         const reclassify = (why: string, evidence: string[]) => {
           const i = classifications.findIndex((x) => x.test === c.test);
           classifications[i] = { ...classifications[i], class: "defect", action: "escalate", evidence: [...classifications[i].evidence, why] };
-          defects.push(makeDefect(state, c.test, test.error ?? why, [why, ...evidence]));
+          defects.push(makeDefect(state, c.test, test.error ?? why, [why, ...evidence], state.defects.length + defects.length + 1));
           deps.bus.decision({ node: "heal", reason: `${c.test}: ${why}; reclassified as defect`, evidence, next: "escalate", at: now() });
         };
         const healableStep = step !== undefined && step.action !== "goto";

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { reportUrl, type RunRecord } from "@/lib/api";
+import { isInFlight, reportUrl, type RunRecord } from "@/lib/api";
 import type { RunProgress } from "@/lib/cases";
 import { Icon, Meter, Spinner, type IconName } from "@/components/ui";
 
@@ -41,7 +41,7 @@ export function ExecutionCard({
   casesHref: string;
 }) {
   const started = new Date(run.startedAt);
-  const inFlight = run.status === "running" || run.status === "awaiting_review";
+  const inFlight = isInFlight(run.status);
   const rate = progress.passRate === null ? "–" : `${Math.round(progress.passRate * 100)}%`;
 
   let headline: string;

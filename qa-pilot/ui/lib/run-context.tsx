@@ -4,7 +4,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { getRun, type ArtifactManifest, type RunRecord } from "./api";
 import { useRunEvents, type RunEvent } from "./events";
 import { usePlan } from "./hooks";
-import { caseRows, isAwaitingReview, isDoneEvents, type CaseRow, type Flow } from "./cases";
+import { caseRows, isAwaitingConfirmation, isAwaitingReview, isDoneEvents, type CaseRow, type Flow } from "./cases";
 import { stages, type Stage } from "./stages";
 
 export type RunContextValue = {
@@ -16,6 +16,8 @@ export type RunContextValue = {
   plan: Flow[] | null;
   rows: CaseRow[];
   awaitingReview: boolean;
+  /** Parked at the defect confirmation gate, waiting for the owner to rule on each candidate. */
+  awaitingConfirmation: boolean;
   /** The four workspace stages with their current status, shared by the rail and every screen. */
   stages: Stage[];
   /** Re-reads the run record and manifest, for example after a rerun or once the run finishes. */
@@ -74,7 +76,8 @@ export function RunProvider({ runId, children }: { runId: string | null; childre
   // finishes and when it parks at (or leaves) the review gate.
   const done = isDoneEvents(events);
   const awaitingReview = isAwaitingReview(events);
-  useEffect(() => { refresh(); }, [done, awaitingReview, refresh]);
+  const awaitingConfirmation = isAwaitingConfirmation(events);
+  useEffect(() => { refresh(); }, [done, awaitingReview, awaitingConfirmation, refresh]);
 
   const rows = useMemo(() => caseRows(events, plan ?? []), [events, plan]);
   const pushEvent = useCallback((e: RunEvent) => setLocal((prev) => [...prev, e]), []);
@@ -88,8 +91,8 @@ export function RunProvider({ runId, children }: { runId: string | null; childre
   }, [params, pathname, router]);
 
   const value = useMemo<RunContextValue>(() => ({
-    runId: runId ?? "", run: record?.run ?? null, manifest: record?.manifest ?? null, error, events, plan, rows, awaitingReview, stages: stageList, refresh, pushEvent, selectedTest, selectTest,
-  }), [runId, record, error, events, plan, rows, awaitingReview, stageList, refresh, pushEvent, selectedTest, selectTest]);
+    runId: runId ?? "", run: record?.run ?? null, manifest: record?.manifest ?? null, error, events, plan, rows, awaitingReview, awaitingConfirmation, stages: stageList, refresh, pushEvent, selectedTest, selectTest,
+  }), [runId, record, error, events, plan, rows, awaitingReview, awaitingConfirmation, stageList, refresh, pushEvent, selectedTest, selectTest]);
 
   return <Ctx.Provider value={runId ? value : null}>{children}</Ctx.Provider>;
 }

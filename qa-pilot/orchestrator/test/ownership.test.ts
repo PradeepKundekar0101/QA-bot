@@ -118,29 +118,8 @@ describe("run ownership", () => {
     // (e.g. "getaddrinfo ENOTFOUND cluster0-xxxxx.mongodb.net"). /health is unauthenticated,
     // so that text must never reach the response body.
     const failingStore: Store = {
-      createUser: () => Promise.reject(new Error("unused")),
-      findUserByEmail: () => Promise.reject(new Error("unused")),
+      ...memoryStore(),
       findUserById: () => Promise.reject(new Error("connect ECONNREFUSED 10.0.0.5:27017")),
-      createSession: () => Promise.reject(new Error("unused")),
-      findSession: () => Promise.reject(new Error("unused")),
-      deleteSession: () => Promise.reject(new Error("unused")),
-      insertRun: () => Promise.reject(new Error("unused")),
-      updateRun: () => Promise.reject(new Error("unused")),
-      touchRun: () => Promise.reject(new Error("unused")),
-      getRun: () => Promise.reject(new Error("unused")),
-      insertChat: () => Promise.reject(new Error("unused")),
-      getChat: () => Promise.reject(new Error("unused")),
-      listChats: () => Promise.reject(new Error("unused")),
-      appendChatTurn: () => Promise.reject(new Error("unused")),
-      deleteChat: () => Promise.reject(new Error("unused")),
-      saveIntegration: () => Promise.reject(new Error("unused")),
-      getIntegration: () => Promise.reject(new Error("unused")),
-      deleteIntegration: () => Promise.reject(new Error("unused")),
-      insertTicket: () => Promise.reject(new Error("unused")),
-      findTicket: () => Promise.reject(new Error("unused")),
-      listTickets: () => Promise.reject(new Error("unused")),
-      listRuns: () => Promise.reject(new Error("unused")),
-      close: () => Promise.resolve(),
     };
     const app = createApi({ start: () => ({ runId: "x" }), store: failingStore });
     const res = await app.request(`${ORIGIN}/health`);

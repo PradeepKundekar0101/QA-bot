@@ -88,6 +88,67 @@ async function walkSafely(kit: BrowserToolkit, flow: Flow, siteMap: SiteMap, dep
   return { ok: false, step: -1, snapshot: "", error };
 }
 
+/**
+ * Walks a proposed flow on the live app, asks for one repair when a step does not resolve,
+ * and returns the flow with the routes it visited, or null with the reason it was dropped.
+ */
+async function walkAndRepair(kit: BrowserToolkit, flow: Flow, siteMap: SiteMap, deps: NodeDeps): Promise<{ flow: Flow | null; why: string; llmCalls: number }> {
+  let llmCalls = 0;
+  let result = await walkSafely(kit, flow, siteMap, deps);
+  let current: Flow = flow;
+  if (!result.ok && result.step >= 0) {
+    deps.bus.log("planner", `flow ${flow.id} step ${result.step} unresolved, asking for repair`, { phase: "repairing", flow: flow.id, step: result.step });
+    const repaired = await deps.llm.complete({
+      prompt: "plan-repair",
+      input: `FLOW:\n${JSON.stringify(flow)}\nFAILING_STEP: ${result.step}\nSNAPSHOT:\n${result.snapshot}`,
+      schema: RepairedFlowSchema,
+      effort: "medium",
+    });
+    llmCalls++;
+    if (repaired.steps.length > 0) {
+      current = repaired as Flow;
+      result = await walkSafely(kit, current, siteMap, deps);
+    }
+  }
+  if (result.ok) return { flow: { ...current, visits: result.visits }, why: "", llmCalls };
+  const why = result.error ? `its page could not be walked (${result.error})` : "step could not be resolved on the live page";
+  return { flow: null, why, llmCalls };
+}
+
+/**
+ * One flow the reviewer described in plain words at the approval checklist, planned against
+ * the run's site map and walked live like any planned flow, so it reaches the checklist only
+ * if it can actually run. The reviewer's current plan is shown to the model so it writes a
+ * new flow rather than repeating one, and an id that still collides gets a suffix.
+ */
+export async function planRequestedFlow(state: RunState, deps: NodeDeps, text: string): Promise<{ flow: Flow | null; reason?: string; llmCalls: number }> {
+  const input = [
+    "MAX_FLOWS: 1",
+    `REQUESTED FLOW: ${text}`,
+    "Write exactly one flow that tests what the tester asked for above. Mark its source as \"intent\".",
+    state.credentials ? `CREDENTIALS: username "${state.credentials.username}" password "${state.credentials.password}"` : "CREDENTIALS: none",
+    state.plan.length ? `ALREADY PLANNED (do not repeat these):\n${JSON.stringify(state.plan.map((f) => ({ id: f.id, title: f.title })))}` : "",
+    `SITE MAP:\n${siteMapSummary(state.siteMap!)}`,
+  ].filter(Boolean).join("\n\n");
+  deps.bus.log("planner", `planning a flow the reviewer asked for: ${text}`);
+  const out = await deps.llm.complete({ prompt: "plan", input, schema: PlanOutputSchema, effort: "medium" });
+  let llmCalls = 1;
+  const proposed = out.flows[0];
+  if (!proposed) return { flow: null, reason: "the planner could not write a flow for that request", llmCalls };
+  const taken = new Set(state.plan.map((f) => f.id));
+  let id = proposed.id;
+  for (let n = 0; taken.has(id); n++) id = `${proposed.id}-${String.fromCharCode(98 + n)}`;
+  const kit = await BrowserToolkit.launch({ headless: deps.headless, baseUrl: state.url, bus: deps.bus, runId: state.runId, agent: "planner", screenshotDir: outputDir(state.runId) + "traces/plan" });
+  try {
+    const walked = await walkAndRepair(kit, { ...(proposed as Flow), id, source: "intent" }, state.siteMap!, deps);
+    llmCalls += walked.llmCalls;
+    deps.bus.log("planner", walked.flow ? `added ${id} to the plan for review` : `could not add the requested flow: ${walked.why}`);
+    return walked.flow ? { flow: { ...walked.flow, id, source: "intent" }, llmCalls } : { flow: null, reason: walked.why, llmCalls };
+  } finally {
+    await kit.close();
+  }
+}
+
 export function renderPlanMd(flows: Flow[]): string {
   const byCat = new Map<string, Flow[]>();
   for (const f of flows) byCat.set(f.category, [...(byCat.get(f.category) ?? []), f]);
@@ -147,28 +208,13 @@ export async function planNode(state: RunState, deps: NodeDeps): Promise<RunUpda
   try {
     for (const [index, flow] of flows.entries()) {
       deps.bus.log("planner", `walking ${flow.id} on the live app`, { phase: "validating", flow: flow.id, title: flow.title, index: index + 1, total: flows.length });
-      let result = await walkSafely(kit, flow, state.siteMap!, deps);
-      let current: Flow = flow;
-      if (!result.ok && result.step >= 0) {
-        deps.bus.log("planner", `flow ${flow.id} step ${result.step} unresolved, asking for repair`, { phase: "repairing", flow: flow.id, step: result.step });
-        const repaired = await deps.llm.complete({
-          prompt: "plan-repair",
-          input: `FLOW:\n${JSON.stringify(flow)}\nFAILING_STEP: ${result.step}\nSNAPSHOT:\n${result.snapshot}`,
-          schema: RepairedFlowSchema,
-          effort: "medium",
-        });
-        llmCalls++;
-        if (repaired.steps.length > 0) {
-          current = repaired as Flow;
-          result = await walkSafely(kit, current, state.siteMap!, deps);
-        }
-      }
-      deps.bus.log("planner", `${result.ok ? "kept" : "dropped"} ${flow.id}`, { phase: "validated", flow: flow.id, ok: result.ok });
-      if (result.ok) kept.push({ ...current, visits: result.visits });
+      const out = await walkAndRepair(kit, flow, state.siteMap!, deps);
+      llmCalls += out.llmCalls;
+      deps.bus.log("planner", `${out.flow ? "kept" : "dropped"} ${flow.id}`, { phase: "validated", flow: flow.id, ok: Boolean(out.flow) });
+      if (out.flow) kept.push(out.flow);
       else {
         unresolved.push(flow.id);
-        const why = !result.ok && result.error ? `its page could not be walked (${result.error})` : "step could not be resolved on the live page";
-        deps.bus.decision({ node: "plan", reason: `dropped flow ${flow.id}: ${why}`, evidence: [flow.title], next: "continue", at: now() });
+        deps.bus.decision({ node: "plan", reason: `dropped flow ${flow.id}: ${out.why}`, evidence: [flow.title], next: "continue", at: now() });
       }
     }
   } finally {

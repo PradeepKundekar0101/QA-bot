@@ -48,6 +48,53 @@ describe("api", () => {
     expect(started).toHaveLength(1);
   });
 
+  it("starts the first run free with the free limits and plan review, whatever the body asks for", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-")) + "/";
+    const started: Record<string, unknown>[] = [];
+    const app = createApi({ store, start: (input) => { started.push(input as Record<string, unknown>); return { runId: input.runId }; } });
+    const headers = { cookie, "content-type": "application/json" };
+    const body = { url: "http://localhost:3005", maxFlows: 50, budget: { maxLlmCalls: 9999, maxMinutes: 600 }, reviewPlan: false, autoHeal: true };
+    const res = await app.request(`${ORIGIN}/run`, { method: "POST", body: JSON.stringify(body), headers });
+    expect(res.status).toBe(200);
+    expect(started[0]).toMatchObject({ tier: "free", maxFlows: 6, budget: { maxLlmCalls: 60, maxMinutes: 5 }, reviewPlan: true, autoHeal: false });
+  });
+
+  it("answers 402 with the price once the free run is spent, and spends a paid credit when there is one", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-")) + "/";
+    const started: Record<string, unknown>[] = [];
+    const app = createApi({ store, start: (input) => { started.push(input as Record<string, unknown>); return { runId: input.runId }; } });
+    const headers = { cookie, "content-type": "application/json" };
+    const post = () => app.request(`${ORIGIN}/run`, { method: "POST", body: JSON.stringify({ url: "http://localhost:3005" }), headers });
+    expect((await post()).status).toBe(200);
+    const blocked = await post();
+    expect(blocked.status).toBe(402);
+    expect(await blocked.json()).toMatchObject({ priceInr: 99 });
+    expect(started).toHaveLength(1);
+
+    await store.grantCredits(userId, 1);
+    expect((await post()).status).toBe(200);
+    expect(started[1]).toMatchObject({ tier: "paid", maxFlows: 12, budget: { maxLlmCalls: 200, maxMinutes: 15 } });
+    expect((await post()).status).toBe(402);
+  });
+
+  it("gives the slot back when the run cannot even start", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-")) + "/";
+    const app = createApi({ store, start: () => { throw new Error("browser would not launch"); } });
+    const headers = { cookie, "content-type": "application/json" };
+    const res = await app.request(`${ORIGIN}/run`, { method: "POST", body: JSON.stringify({ url: "http://localhost:3005" }), headers });
+    expect(res.status).toBe(500);
+    expect(await store.getWallet(userId)).toEqual({ freeRunUsed: false, paidCredits: 0 });
+  });
+
+  it("reports the account's wallet and the price of a paid run", async () => {
+    await store.grantCredits(userId, 2);
+    const app = createApi({ store, start: () => ({ runId: "x" }) });
+    const res = await app.request(`${ORIGIN}/wallet`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ freeRunUsed: false, paidCredits: 2, priceInr: 99, tiers: { free: { maxFlows: 6, maxMinutes: 5 }, paid: { maxFlows: 12, maxMinutes: 15 } } });
+    expect((await app.request(`${ORIGIN}/wallet`)).status).toBe(401);
+  });
+
   it("replays events over SSE and serves the report", async () => {
     process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api2-")) + "/";
     const bus = getBus("api-r1");
@@ -192,6 +239,59 @@ describe("plan review and single-test rerun routes", () => {
 
     const foreign = await app.request(`${ORIGIN}/runs/somebody-elses/review`, { method: "POST", body: JSON.stringify({ flows }), headers });
     expect(foreign.status).toBe(404);
+  });
+
+  it("plans a flow the reviewer asked for in plain words, and says why when it cannot", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-addflow-")) + "/";
+    await own("rv-2");
+    const flow = { id: "cart-001", title: "Add a product to the cart", category: "happy", priority: "P1", preconditions: ["logged_in"], source: "intent",
+      steps: [{ action: "goto", target: "/products" }], expected: [{ type: "url_contains", value: "/products" }] };
+    const asked: string[] = [];
+    const app = createApi({ store, start: () => ({ runId: "x" }), addReviewFlow: async (_runId, text) => {
+      asked.push(text);
+      return text.includes("teleport") ? { flow: null, reason: "step could not be resolved on the live page" } : { flow: flow as never };
+    } });
+    const headers = { cookie, "content-type": "application/json" };
+    const post = (runId: string, text: unknown) => app.request(`${ORIGIN}/runs/${runId}/review/flows`, { method: "POST", body: JSON.stringify({ text }), headers });
+
+    const ok = await post("rv-2", "  add a product to the cart  ");
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).flow.id).toBe("cart-001");
+    expect(asked).toEqual(["add a product to the cart"]);
+    expect((await post("rv-2", "teleport to checkout")).status).toBe(422);
+    expect((await post("rv-2", "")).status).toBe(400);
+    expect((await post("someone-elses", "add a product")).status).toBe(404);
+  });
+
+  it("409s an added flow when the run is not waiting for review", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-addflow-")) + "/";
+    await own("rv-3");
+    const app = createApi({ store, start: () => ({ runId: "x" }) });
+    const res = await app.request(`${ORIGIN}/runs/rv-3/review/flows`, { method: "POST", body: JSON.stringify({ text: "add a product to the cart" }), headers: { cookie, "content-type": "application/json" } });
+    expect(res.status).toBe(409);
+  });
+
+  it("lists candidate defects and records the owner's rulings on them", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-api-defects-")) + "/";
+    await own("df-1");
+    mkdirSync(process.env.QA_PILOT_OUTPUT + "df-1", { recursive: true });
+    const defect = { id: "DEF-1-checkout-001", title: "Coupon fails", severity: "high", flow: "checkout-001", repro_steps: [], expected: "", actual: "", evidence: ["POST /api/coupon returned 500"], attachments: [], confidence: 0.9, needsLook: false };
+    writeFileSync(process.env.QA_PILOT_OUTPUT + "df-1/defects.json", JSON.stringify([defect]));
+    const app = createApi({ store, start: () => ({ runId: "x" }) });
+    const headers = { cookie, "content-type": "application/json" };
+
+    const list = await (await app.request(`${ORIGIN}/runs/df-1/defects`, { headers })).json();
+    expect(list).toMatchObject({ defects: [{ id: defect.id }], verdicts: [], awaiting: false });
+
+    const unknown = await app.request(`${ORIGIN}/runs/df-1/defects`, { method: "POST", body: JSON.stringify({ verdicts: [{ defectId: "DEF-9", verdict: "confirmed" }] }), headers });
+    expect(unknown.status).toBe(404);
+    const bad = await app.request(`${ORIGIN}/runs/df-1/defects`, { method: "POST", body: JSON.stringify({ verdicts: [{ defectId: defect.id, verdict: "maybe" }] }), headers });
+    expect(bad.status).toBe(400);
+
+    const ok = await app.request(`${ORIGIN}/runs/df-1/defects`, { method: "POST", body: JSON.stringify({ verdicts: [{ defectId: defect.id, verdict: "confirmed" }] }), headers });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ undecided: [], resumed: false, verdicts: [{ defectId: defect.id, verdict: "confirmed", by: "owner" }] });
+    expect((await app.request(`${ORIGIN}/runs/someone-elses/defects`, { headers })).status).toBe(404);
   });
 
   it("re-runs one test of a finished run, and refuses while the run is in progress or its session is gone", async () => {

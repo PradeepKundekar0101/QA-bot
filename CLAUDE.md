@@ -2,69 +2,51 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository status
+## What this repo is
 
-This repo currently contains no application code — just `README.md` and
-`problem_explanation_9dm9yp4f98s.pdf` (the hackathon problem statement). There
-is no build system, package manifest, test runner, or lint config yet. When
-the first code is added, update this file with the actual commands
-(build/lint/test/run) and the real architecture — don't rely on this section
-staying accurate once implementation starts.
+qa-pilot: paste a web app URL, approve a test plan, get real bugs instead of red tests.
+It started as the Bessemer Tech Catalyst submission (autonomous test orchestration, spec in `problem_explanation_9dm9yp4f98s.pdf`).
+The current target is the Airtribe x Pine Labs AI Builders Day edition, spec in `docs/2026-10-24-prd-ai-builders-day.md`, build plan in `docs/superpowers/plans/2026-10-24-ai-builders-day.md`.
+The main differences from the original spec: a human approves the plan and confirms every defect, runs are tiered and paid through Pine Labs, healing is off on web runs, and a defect-triage agent runs on AgenticOrg.
 
-## What this repo is for
+## Layout
 
-Shared repo for a hackathon submission to the **Bessemer Tech Catalyst**
-(AI/ML track), organized by Aivar Innovations. Full spec:
-`problem_explanation_9dm9yp4f98s.pdf`.
+All code lives in `qa-pilot/`, an npm workspace (Node 22+, TypeScript, ESM).
 
-### The problem to solve: Autonomous Test Orchestration Agent
+- `orchestrator/` - the LangGraph pipeline, the Hono API, the CLI, storage, billing and the triage agent's tools.
+- `ui/` - the Next.js web app (read `ui/AGENTS.md`: this Next.js version differs from older ones).
+- `runner/` - the Playwright runner package.
+- `targets/mini-shop/` - a small Express shop used as the test target, with a `/__chaos` switch that breaks things on purpose.
+- `output/<runId>/` - everything a run writes: plan, specs, results, traces, `defects.json`, `verdicts.json`, `triage-log.jsonl`, `decisions.jsonl`, the report.
 
-Build an agent that takes a web application URL and autonomously drives the
-full testing lifecycle — planning, generation, execution, repair — with no
-human intervention between stages, and no manually written test scripts.
+## Commands
 
-**Required pipeline (a meta-agent coordinating three sub-agents):**
-1. **Planner** — explores the target app, produces a structured, human-readable
-   test plan covering meaningful user flows (not just happy paths).
-2. **Meta-agent gap check** — evaluates the plan for coverage gaps (missing
-   flows, edge cases, error states) before handing off to the Generator.
-3. **Generator** — converts the plan into executable test files, with live
-   selector/assertion validation against the running app.
-4. **Execution + Healer** — runs the suite; on failures, the Healer replays and
-   repairs broken locators/flows, and the system must distinguish a broken
-   test script from a genuine application defect.
-5. **Final report** — scenarios covered, pass/fail outcomes, healer actions
-   taken, remaining coverage gaps, untested-flow risk.
+Run from `qa-pilot/`.
 
-**Good to have:** optional PRD input to steer Planner scope, natural-language
-scoping (e.g. "focus on checkout and auth"), parallel test execution across
-flows.
+- `npm install`, then `npm rebuild better-sqlite3` if Node was upgraded (the checkpointer is native).
+- `npm test` - vitest across orchestrator, mini-shop and ui; the graph tests drive real Chromium against mini-shop.
+- `npm run typecheck` and, in `ui/`, `npx eslint`.
+- `npm run shop` (port 3005), `npm run api` (port 4000), `npm run ui` (port 3000).
+- `QA_PILOT_STORE=memory npm run api` runs without MongoDB; data is lost on restart.
+- `npm run qa-pilot -- <url>` - the CLI, which keeps its own flags for flows, budget and healing.
 
-**Bonus:** PRD-vs-test-plan gap analysis; confident defect classification
-(script bug vs. app bug).
+Configuration is in `qa-pilot/.env`; `qa-pilot/.env.example` lists every setting.
 
-**Explicitly out of scope:** production deployment/hosting at scale, CI/CD
-integration, cross-browser matrix testing, complete coverage of a production
-app, hand-written test scripts.
+## Pipeline
 
-**Constraints to keep in mind while building:**
-- Bring your own test target (self-hosted OSS app, an existing sample app, or
-  any public demo app) rather than waiting on organiser-provided URLs.
-- Each team must supply its own LLM API keys — none are provided by the
-  organiser.
-- Evaluation weighting: end-to-end functionality (30%), orchestration
-  intelligence / handling of ambiguity & gaps (20%), code quality & healer
-  depth (20%), demo/UX clarity (15%), business impact (10%), presentation (5%).
-- Submission needs: working prototype, source repo with setup instructions,
-  README covering architecture/pipeline design, an architecture diagram of
-  the sub-agent orchestration flow, a 2–5 min demo video, and a slide deck.
+`orchestrator/src/graph.ts`: explore -> plan -> evaluate_coverage -> review -> generate -> run -> classify -> await_defect_confirmation -> report, with heal and rerun loops after classify.
+Every branch writes a `Decision` to the event bus; that stream is the live view and must stay explicit.
+`review` and `await_defect_confirmation` are interrupt nodes; `run.ts` parks the run at each and resumes it when the API receives the person's answer.
 
-## Working in this repo
+Rules to keep:
+- The web API (`POST /run`) sets the flow cap, budget, plan review and healing from the account's tier (`billing/tiers.ts`); a client cannot choose them.
+- No defect is filed without a `confirmed` ruling; `integrations/file.ts` enforces this for both the owner and the agent.
+- The classifier's rules set the label; the model may move a confidence by at most 0.2.
 
-- No stack has been chosen yet. When scaffolding the project, pick a stack
-  and record it here (commands to install, run the orchestrator, run each
-  sub-agent, and run any tests) so future sessions don't have to rediscover it.
-- Since the deliverable *is* an agent pipeline (Planner → gap-check →
-  Generator → Execute/Heal → Report), keep that stage boundary explicit in
-  whatever code structure gets built — the evaluation criteria specifically
-  reward visible orchestration logic, not just working tests.
+## Integrations
+
+- Payments: `billing/pinelabs.ts` (hosted checkout, Standard Webhooks signature check), routes `/checkout`, `/webhooks/pinelabs`, `/checkout/return`. A payment grants one credit exactly once.
+- Triage agent: qa-pilot serves its tools as a remote MCP server at `/mcp` (`triage/mcp.ts`, bearer `QA_PILOT_AGENT_TOKEN`) and starts the AgenticOrg agent through its A2A tasks API (`triage/agenticorg.ts`) when a run holds candidates.
+- Trackers: Linear and Jira through Composio (`integrations/`).
+
+The Pine Labs response fields and AgenticOrg's auth header are not pinned down by their docs; both clients read them defensively and the AgenticOrg path and header are configurable.

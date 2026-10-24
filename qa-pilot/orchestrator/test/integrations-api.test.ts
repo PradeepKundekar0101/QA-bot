@@ -7,6 +7,7 @@ import { memoryStore } from "../src/store/memory.js";
 import { TrackerError } from "../src/integrations/errors.js";
 import type { Destination, TrackerClient } from "../src/integrations/index.js";
 import type { TicketBody } from "../src/integrations/ticket.js";
+import { readVerdicts } from "../src/defects/verdicts.js";
 import type { Store, RunRecord, TrackerProvider } from "../src/store/types.js";
 import { hashToken, mintToken, SESSION_COOKIE, SESSION_TTL_MS } from "../src/auth/session.js";
 import { clearSessionCache } from "../src/auth/middleware.js";
@@ -227,6 +228,26 @@ describe("tickets", () => {
     expect((await second.json()).ticket.id).toBe(ticket.id);
     expect(filed).toHaveLength(1);
     expect((await (await get(app, "/runs/shop-1/tickets")).json()).tickets.map((t: { key: string }) => t.key)).toEqual(["ENG-9"]);
+  });
+
+  it("records filing a candidate defect as the owner's confirmation, and refuses one they ruled out", async () => {
+    const { trackers, filed } = fakeTrackers();
+    const app = api(trackers);
+    await connectLinear(app);
+    expect((await send(app, "POST", "/runs/shop-1/tests/checkout-001/ticket")).status).toBe(200);
+    expect(readVerdicts("shop-1")).toMatchObject([{ defectId: "DEF-1-checkout-001", verdict: "confirmed", by: "owner" }]);
+
+    store = memoryStore();
+    ({ userId, headers } = await signIn("tickets2@example.com"));
+    await store.insertRun(run("shop-2"));
+    seedRun("shop-2");
+    const app2 = api(trackers);
+    await connectLinear(app2);
+    expect((await send(app2, "POST", "/runs/shop-2/defects", { verdicts: [{ defectId: "DEF-1-checkout-001", verdict: "script" }] })).status).toBe(200);
+    const refused = await send(app2, "POST", "/runs/shop-2/tests/checkout-001/ticket");
+    expect(refused.status).toBe(409);
+    expect((await refused.json()).error).toMatch(/script bug/);
+    expect(filed).toHaveLength(1);
   });
 
   it("answers 404 for a run the user does not own and for a test not in the plan", async () => {

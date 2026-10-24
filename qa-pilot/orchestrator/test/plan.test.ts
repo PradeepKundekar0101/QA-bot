@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startShop } from "./helpers/shop.js";
 import { crawl } from "../src/nodes/explore.js";
-import { planNode, renderPlanMd } from "../src/nodes/plan.js";
+import { planNode, planRequestedFlow, renderPlanMd } from "../src/nodes/plan.js";
 import { BrowserToolkit } from "../src/browser/toolkit.js";
 import { initialState, type Flow, type SiteMap } from "../src/state.js";
 import { EventBus } from "../src/events.js";
@@ -129,5 +129,37 @@ describe("the model-facing plan schema", () => {
     const { PlanOutputSchema, RepairedFlowSchema } = await import("../src/nodes/plan.js");
     expect(Object.keys(PlanOutputSchema.shape.flows.element.shape)).not.toContain("visits");
     expect(Object.keys(RepairedFlowSchema.shape)).not.toContain("visits");
+  });
+});
+
+describe("planRequestedFlow", () => {
+  it("plans one flow from plain words against the existing site map, walks it live, and keeps ids unique", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-plan-add-")) + "/";
+    const bus = new EventBus("r", process.env.QA_PILOT_OUTPUT + "r/");
+    let seen = "";
+    const llm = new FakeLlmClient({ plan: (input: string) => { seen = input; return { flows: [good] }; } });
+    const state = { ...initialState({ runId: "r", url: shop.base }), siteMap, plan: [good] };
+    const out = await planRequestedFlow(state, { bus, llm, headless: true }, "a wrong password shows an error");
+    expect(seen).toContain("MAX_FLOWS: 1");
+    expect(seen).toContain("REQUESTED FLOW: a wrong password shows an error");
+    expect(seen).toContain("auth-002");          // the reviewer's current plan, so the model does not repeat it
+    expect(out.flow?.id).toBe("auth-002-b");     // the id collided with a flow already on the checklist
+    expect(out.flow?.source).toBe("intent");
+    expect(out.flow?.visits).toEqual(["/login"]);
+    expect(out.llmCalls).toBe(1);
+  });
+
+  it("says why when the requested flow cannot be walked on the live app", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-plan-add-")) + "/";
+    const bus = new EventBus("r", process.env.QA_PILOT_OUTPUT + "r/");
+    const llm = new FakeLlmClient({
+      plan: { flows: [hallucinated] },
+      "plan-repair": (input: string) => ({ ...JSON.parse(input.split("FLOW:\n")[1].split("\nFAILING_STEP")[0]), steps: [] }),
+    });
+    const state = { ...initialState({ runId: "r", url: shop.base }), siteMap, plan: [] };
+    const out = await planRequestedFlow(state, { bus, llm, headless: true }, "teleport to checkout");
+    expect(out.flow).toBeNull();
+    expect(out.reason).toMatch(/could not be resolved/);
+    expect(out.llmCalls).toBe(2);
   });
 });

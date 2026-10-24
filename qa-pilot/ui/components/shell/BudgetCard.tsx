@@ -1,35 +1,35 @@
 "use client";
+import Link from "next/link";
 import { useEffect, useState } from "react";
-import { Icon, Meter } from "@/components/ui";
-import { listRuns } from "@/lib/api";
+import { Icon } from "@/components/ui";
+import { getWallet, type Wallet } from "@/lib/api";
 
-/** The API's default per-run cap, which is what a single run is measured against. */
-const PER_RUN_CAP = 200;
-
+/**
+ * What the account can still run: the free first run, paid runs bought and not yet used, or
+ * nothing until the next payment. The limits behind each kind are the server's; this card
+ * only reports what is left and points at the start form, where paying happens.
+ */
 export function BudgetCard() {
-  const [totals, setTotals] = useState<{ runs: number; calls: number } | null>(null);
+  const [wallet, setWallet] = useState<Wallet | null>(null);
 
   useEffect(() => {
-    // Deliberately the same /runs call the Overview page makes. The list is small and
-    // per-account, so a second fetch is cheaper than threading shared state through the
-    // shell for one card.
-    listRuns()
-      .then((runs) => setTotals({ runs: runs.length, calls: runs.reduce((n, r) => n + (r.llmCalls ?? 0), 0) }))
-      .catch(() => setTotals(null));
+    getWallet().then(setWallet).catch(() => setWallet(null));
   }, []);
 
-  if (!totals) return null;
-  const latestRunShare = Math.min(totals.calls, PER_RUN_CAP);
+  if (!wallet) return null;
+  const line = !wallet.freeRunUsed ? "Your first run is free."
+    : wallet.paidCredits > 0 ? `${wallet.paidCredits} paid ${wallet.paidCredits === 1 ? "run" : "runs"} left.`
+    : `No runs left. A run costs ₹${wallet.priceInr}.`;
 
   return (
-    <div className="space-y-2 rounded-box border border-line bg-surface p-3">
+    <div className="space-y-1.5 rounded-box border border-line bg-surface p-3">
       <p className="flex items-center gap-1.5 text-[12px] font-medium tracking-[0.2px] text-fg">
-        <Icon name="sparkles" size={13} className="text-muted" /> LLM budget
+        <Icon name="bolt" size={13} className="text-muted" /> Runs
       </p>
-      <Meter value={latestRunShare} max={PER_RUN_CAP} />
-      <p className="text-[11px] leading-relaxed text-subtle">
-        {totals.calls} calls across {totals.runs} {totals.runs === 1 ? "run" : "runs"} · {PER_RUN_CAP} is the per-run cap.
-      </p>
+      <p className="text-[11.5px] leading-relaxed text-muted">{line}</p>
+      {wallet.freeRunUsed && wallet.paidCredits === 0 && (
+        <Link href="/runs/new" className="inline-flex text-[11.5px] font-medium text-info hover:underline">Buy a run</Link>
+      )}
     </div>
   );
 }

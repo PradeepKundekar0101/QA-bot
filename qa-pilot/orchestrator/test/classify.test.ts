@@ -71,6 +71,17 @@ describe("classifyOne", () => {
     const e: Evidence = { test: { ...base, failingStep: 1, error: "Timeout waiting for getByRole('button', { name: 'Place order' })" }, flow, snapshotAtFailure: `- button "Complete purchase"`, controlPassed: true, sameLocatorFailures: 2 };
     expect(classifyOne(e, 2, 0).action).toBe("escalate");
   });
+  it("never heals when the run has healing off, and reports the test as needing a fix", () => {
+    const e: Evidence = { test: { ...base, failingStep: 1, error: "Timeout waiting for getByRole('button', { name: 'Place order' })" }, flow, snapshotAtFailure: `- button "Complete purchase"`, controlPassed: true, sameLocatorFailures: 2 };
+    const c = classifyOne(e, 0, 0, { autoHeal: false });
+    expect(c.class).toBe("script");
+    expect(c.action).toBe("escalate");
+  });
+  it("reruns a mid-band failure once, not twice", () => {
+    const e: Evidence = { test: { ...base, failingStep: 1, error: "expect(locator).toContainText failed\nExpected: Order confirmed\nReceived: Order placed" }, flow, snapshotAtFailure: `- button "Place order"`, controlPassed: true, sameLocatorFailures: 0 };
+    expect(classifyOne(e, 0, 0).action).toBe("rerun");
+    expect(classifyOne(e, 0, 1).action).not.toBe("rerun");
+  });
 });
 
 describe("afterClassify", () => {
@@ -102,6 +113,13 @@ describe("afterClassify", () => {
     before = decisionCount();
     expect(afterClassify({ ...state, classifications: [] }, deps)).toBe("report");
     expect(decisionCount() - before).toBe(1);
+
+    // Escalated defects wait for a person before the report, and nothing is filed meanwhile.
+    before = decisionCount();
+    const escalated: Classification[] = [{ test: "a", class: "defect", confidence: 0.9, evidence: ["POST /api/coupon returned 500"], action: "escalate" }];
+    const defects = [{ id: "DEF-1-a", title: "t", severity: "high" as const, flow: "a", repro_steps: [], expected: "", actual: "", evidence: [], attachments: [], confidence: 0.9 }];
+    expect(afterClassify({ ...state, classifications: escalated, defects }, deps)).toBe("confirm");
+    expect(decisionCount() - before).toBe(1);
   });
 });
 
@@ -124,6 +142,8 @@ describe("makeDefect", () => {
     );
     expect(defect.attachments).toEqual(["/tmp/t/trace.zip"]);
     expect(defect.actual).toBe("500 Internal Server Error");
+    // Defects built in one batch are numbered by their place in the run, not all as the next one.
+    expect(makeDefect(state, "checkout-002", "x", evidence, 4).id).toBe("DEF-4-checkout-002");
   });
 });
 
@@ -152,6 +172,8 @@ describe("adjustConfidence", () => {
     expect(adjustConfidence(0.9, -0.1)).toBe(0.9);
     expect(adjustConfidence(0.4, 0.1)).toBe(0.4);
     expect(adjustConfidence(0.79, 0.1)).toBe(0.89);
+    expect(adjustConfidence(0.6, 0.2)).toBe(0.8);
+    expect(adjustConfidence(0.7, -0.2)).toBe(0.5);
   });
 });
 

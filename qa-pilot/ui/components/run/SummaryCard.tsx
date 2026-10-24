@@ -11,7 +11,8 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 export function SummaryCard({ run }: { run: RunRecord }) {
-  const budget = 200; // the API's default maxLlmCalls; the run record stores the count, not the cap
+  // Runs recorded before the cap was stored ran under the old 200-call default.
+  const budget = run.maxLlmCalls ?? 200;
   return (
     <Card title="Summary">
       <div className="py-1">
@@ -29,6 +30,7 @@ export function SummaryCard({ run }: { run: RunRecord }) {
           )}
         />
         <Row label="Heals accepted" value={run.healsAccepted ?? "-"} />
+        {run.tier && <Row label="Run" value={<span className="font-sans">{run.tier === "free" ? "free" : "paid"}</span>} />}
         <Row label="Defects escalated" value={<span className={run.defectsCount ? "text-defect" : undefined}>{run.defectsCount ?? "-"}</span>} />
         <Row label="LLM calls" value={run.llmCalls == null ? "-" : `${run.llmCalls} / ${budget}`} />
         {run.partialReason && <Row label="Stopped because" value={<span className="font-sans text-flaky">{run.partialReason}</span>} />}

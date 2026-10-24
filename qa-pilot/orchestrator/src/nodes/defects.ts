@@ -1,11 +1,15 @@
 import { effectiveExpectations, type Defect, type RunState } from "../state.js";
 
-/** Builds a paste-ready ticket from the flow, the test result, and the evidence list. */
-export function makeDefect(state: RunState, testId: string, actual: string, evidence: string[]): Defect {
+/**
+ * Builds a paste-ready ticket from the flow, the test result, and the evidence list. `seq` is
+ * the defect's number in the run; a caller building several at once passes each its own,
+ * since `state.defects` does not grow until the node returns.
+ */
+export function makeDefect(state: RunState, testId: string, actual: string, evidence: string[], seq: number = state.defects.length + 1): Defect {
   const flow = state.plan.find((f) => f.id === testId)!;
   const test = state.results?.tests.find((t) => t.id === testId);
   return {
-    id: `DEF-${state.defects.length + 1}-${testId}`,
+    id: `DEF-${seq}-${testId}`,
     title: `${flow.title}: ${evidence[0] ?? "unexpected behaviour"}`.slice(0, 120),
     severity: flow.priority === "P0" ? "critical" : flow.priority === "P1" ? "high" : "medium",
     flow: testId,

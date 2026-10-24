@@ -3,7 +3,12 @@
 export const API = process.env.NEXT_PUBLIC_QA_PILOT_API ?? "http://localhost:4000";
 
 export type PublicUser = { id: string; email: string; createdAt: string };
-export type RunStatus = "running" | "awaiting_review" | "done" | "partial" | "failed" | "interrupted";
+export type RunStatus = "running" | "awaiting_review" | "awaiting_confirmation" | "done" | "partial" | "failed" | "interrupted";
+
+/** A run paused at one of the two human gates: the plan review or the defect confirmation. */
+export const isPaused = (status: RunStatus | undefined) => status === "awaiting_review" || status === "awaiting_confirmation";
+/** A run that is still going, paused or not. */
+export const isInFlight = (status: RunStatus | undefined) => status === "running" || isPaused(status);
 
 export type RunRecord = {
   id: string; userId: string; url: string; intent?: string; hasPrd: boolean;
@@ -11,6 +16,12 @@ export type RunRecord = {
   durationMs?: number; coverageScore?: number; planIterations?: number; flowsTotal?: number;
   testsPassed?: number; testsFailed?: number; healsAccepted?: number; defectsCount?: number;
   llmCalls?: number; partialReason?: string;
+  /** What the run was paid with. Absent on runs recorded before tiers and on CLI runs. */
+  tier?: "free" | "paid";
+  /** The run's own LLM-call cap. Absent on runs recorded before caps were stored. */
+  maxLlmCalls?: number;
+  /** How many flows the run may generate; the review sheet holds the selection to this. */
+  maxFlows?: number;
 };
 
 export type ArtifactManifest = { files: string[]; traces: string[]; hasReport: boolean; hasSuite: boolean };
@@ -20,10 +31,6 @@ export type NewRunInput = {
   intent?: string;
   prd?: string;
   credentials?: { username: string; password: string };
-  maxFlows?: number;
-  budget?: { maxLlmCalls: number; maxMinutes: number };
-  /** Pause after the coverage gate so the plan can be reviewed before tests are generated. */
-  reviewPlan?: boolean;
   /** The chat this run was configured in, so the conversation links to what it produced. */
   chatId?: string;
 };
@@ -54,8 +61,7 @@ export type ChatScope = { url?: string; runId?: string };
 /** What a chat has assembled so far. Never carries the target app's credentials. */
 export type ChatDraft = {
   url?: string; intent?: string; prdText?: string; prdName?: string;
-  requiresSignIn?: boolean; maxFlows?: number;
-  budget?: { maxLlmCalls?: number; maxMinutes?: number }; reviewPlan?: boolean;
+  requiresSignIn?: boolean;
 };
 
 export type Chat = {
@@ -130,6 +136,53 @@ export const startRun = (input: NewRunInput) =>
 /** Hands the reviewed (possibly trimmed or edited) plan to a run parked at the review gate. */
 export const submitReview = (runId: string, flows: unknown[]) =>
   apiFetch<{ ok: true; flows: number }>(`/runs/${encodeURIComponent(runId)}/review`, { method: "POST", body: JSON.stringify({ flows }) });
+
+/**
+ * Plans one flow from the reviewer's plain words while the run waits at review. The flow comes
+ * back for the checklist; it joins the plan only if it is ticked when the review is submitted.
+ */
+export const addReviewFlow = (runId: string, text: string) =>
+  apiFetch<{ flow: unknown }>(`/runs/${encodeURIComponent(runId)}/review/flows`, { method: "POST", body: JSON.stringify({ text }) }).then((r) => r.flow);
+
+/** What the account can still start runs with, and what the tiers allow. */
+export type Wallet = {
+  freeRunUsed: boolean;
+  paidCredits: number;
+  priceInr: number;
+  tiers: Record<"free" | "paid", { maxFlows: number; maxMinutes: number }>;
+};
+
+export const getWallet = () => apiFetch<Wallet>("/wallet");
+
+/** Opens a Pine Labs checkout for one paid run; the browser must visit `redirectUrl`. */
+export const startCheckout = () => apiFetch<{ ref: string; redirectUrl: string }>("/checkout", { method: "POST" });
+
+export const getPayment = (ref: string) =>
+  apiFetch<{ status: "created" | "paid" | "failed" }>(`/payments/${encodeURIComponent(ref)}`).then((r) => r.status);
+
+/** A candidate defect the classifier escalated, waiting for the owner's ruling. */
+export type Defect = {
+  id: string; title: string; severity: "critical" | "high" | "medium" | "low"; flow: string;
+  repro_steps: string[]; expected: string; actual: string; evidence: string[]; attachments: string[];
+  confidence?: number; needsLook?: boolean; rationale?: string;
+  /** The page where the test failed, as an absolute output path. */
+  screenshot?: string;
+};
+
+export type DefectVerdict = {
+  defectId: string;
+  verdict: "confirmed" | "rejected" | "script";
+  note?: string;
+  by: "owner" | "agent";
+  at: string;
+};
+
+export const getDefects = (runId: string) =>
+  apiFetch<{ defects: Defect[]; verdicts: DefectVerdict[]; awaiting: boolean }>(`/runs/${encodeURIComponent(runId)}/defects`);
+
+/** Records the owner's rulings; once nothing is undecided a paused run resumes into its report. */
+export const submitVerdicts = (runId: string, verdicts: Pick<DefectVerdict, "defectId" | "verdict" | "note">[]) =>
+  apiFetch<{ verdicts: DefectVerdict[]; undecided: string[]; resumed: boolean }>(`/runs/${encodeURIComponent(runId)}/defects`, { method: "POST", body: JSON.stringify({ verdicts }) });
 
 /** Re-executes one generated test of a finished run; resolves with its fresh result. */
 export const rerunTest = (runId: string, testId: string) =>

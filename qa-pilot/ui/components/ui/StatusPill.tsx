@@ -12,6 +12,7 @@ const STYLES: Record<string, Style> = {
   // run status
   running:         { label: "running",         icon: "dashedCircle", className: "bg-info/12 text-info", spin: true },
   awaiting_review: { label: "awaiting review", icon: "clipboard",    className: "bg-human/12 text-human" },
+  awaiting_confirmation: { label: "confirm defects", icon: "bug", className: "bg-human/12 text-human" },
   done:            { label: "done",            icon: "check",        className: "bg-pass/12 text-pass" },
   partial:         { label: "partial",         icon: "halfCircle",   className: "bg-flaky/12 text-flaky" },
   failed:          { label: "failed",          icon: "x",            className: "bg-fail/12 text-fail" },

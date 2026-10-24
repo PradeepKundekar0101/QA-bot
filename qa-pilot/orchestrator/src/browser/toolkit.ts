@@ -151,10 +151,15 @@ export class BrowserToolkit {
     return page.locator("body").ariaSnapshot();
   }
 
-  async screenshot(page: Page, label: string): Promise<string> {
+  /**
+   * Step pictures for the live view are throttled to one per half second. `evidence` skips the
+   * throttle: a picture someone will rule a defect on must not be lost to the step shot taken
+   * just before it.
+   */
+  async screenshot(page: Page, label: string, opts: { evidence?: boolean } = {}): Promise<string> {
     if (!this.shotDir) return "";
     const now = Date.now();
-    if (now - this.lastShot < 500) return "";
+    if (!opts.evidence && now - this.lastShot < 500) return "";
     this.lastShot = now;
     const file = `${this.shotDir}/${now}-${label.replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}.png`;
     // A screenshot is a picture for the run screen, never part of the verdict. A page that

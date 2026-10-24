@@ -1,0 +1,40 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mini-shop",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "qa-pilot/targets/mini-shop",
+        "start"
+      ],
+      "port": 3005
+    },
+    {
+      "name": "api-e2e",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "QA_PILOT_STORE=memory",
+        "QA_PILOT_AGENT_TOKEN=e2e-agent-token",
+        "npm",
+        "--prefix",
+        "qa-pilot",
+        "run",
+        "api"
+      ],
+      "port": 4000
+    },
+    {
+      "name": "ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "qa-pilot/ui",
+        "run",
+        "dev"
+      ],
+      "port": 3000
+    }
+  ]
+}
