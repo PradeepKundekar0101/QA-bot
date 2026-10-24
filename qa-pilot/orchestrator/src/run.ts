@@ -2,7 +2,10 @@ import "./env.js";
 import { getBus, type EventBus } from "./events.js";
 import { disposeScreencast } from "./browser/screencast.js";
 import { makeLlmClient, type LlmClient } from "./llm/client.js";
-import { buildGraph, REVIEW_NODE } from "./graph.js";
+import { buildGraph, CONFIRM_NODE, REVIEW_NODE } from "./graph.js";
+import { now, type NodeDeps } from "./nodes/deps.js";
+import { planRequestedFlow } from "./nodes/plan.js";
+import { readVerdicts, recordVerdicts, undecided, type VerdictSubmission } from "./defects/verdicts.js";
 import { FlowSchema, initialState, outputDir, StartRunInputSchema, type Flow, type StartRunInput, type RunState } from "./state.js";
 import { z } from "zod";
 import { readOutput, writeOutput } from "./output.js";
@@ -10,7 +13,7 @@ import { defaultStore } from "./store/index.js";
 import type { RunRecord, Store } from "./store/types.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { runPlaywright } from "./nodes/run.js";
-import type { RunResults, Step, TestResult } from "./state.js";
+import type { Defect, DefectVerdict, RunResults, Step, TestResult } from "./state.js";
 
 export function newRunId(): string {
   return `run-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
@@ -37,19 +40,35 @@ export function summarise(state: RunState, startedAt: string, finishedAt: string
   };
 }
 
-// ---------- Plan review ----------
+// ---------- Approval gates ----------
 
 /**
- * Runs paused at the review gate, keyed by run id. The graph is checkpointed, so the pause
- * itself survives anything; this map only holds the resolver that wakes the in-process
- * loop in `startRun`. A run that is not in here is not waiting for review.
+ * Runs paused at one of the two human gates - the plan review, or the defect confirmation -
+ * keyed by run id. The graph is checkpointed, so the pause itself survives anything; this map
+ * holds what the in-process loop in `startRun` needs to wake up, plus the paused state and the
+ * node dependencies so a reviewer's "add a flow" request can be planned against the run's own
+ * site map. A run that is not in here is not waiting on anybody.
  */
-const pendingReviews = new Map<string, (plan: Flow[]) => void>();
+type Gate =
+  | { node: typeof REVIEW_NODE; state: RunState; deps: NodeDeps; added: Flow[]; resume: (plan: Flow[]) => void }
+  | { node: typeof CONFIRM_NODE; state: RunState; resume: () => void };
+const gates = new Map<string, Gate>();
 
 export const ReviewSubmissionSchema = z.object({ flows: z.array(FlowSchema) });
+export const AddFlowSchema = z.object({ text: z.string().trim().min(3).max(500) });
 
 export function awaitingReview(runId: string): boolean {
-  return pendingReviews.has(runId);
+  return gates.get(runId)?.node === REVIEW_NODE;
+}
+
+/** The most flows a reviewer may approve for a run waiting at review, or null when it is not waiting. */
+export function reviewFlowCap(runId: string): number | null {
+  const gate = gates.get(runId);
+  return gate?.node === REVIEW_NODE ? gate.state.maxFlows : null;
+}
+
+export function awaitingConfirmation(runId: string): boolean {
+  return gates.get(runId)?.node === CONFIRM_NODE;
 }
 
 /**
@@ -57,15 +76,41 @@ export function awaitingReview(runId: string): boolean {
  * run is not waiting, so the API can answer 409 instead of silently dropping the plan.
  */
 export function submitReview(runId: string, flows: Flow[]): boolean {
-  const resume = pendingReviews.get(runId);
-  if (!resume) return false;
-  pendingReviews.delete(runId);
-  resume(flows);
+  const gate = gates.get(runId);
+  if (gate?.node !== REVIEW_NODE) return false;
+  gates.delete(runId);
+  gate.resume(flows);
   return true;
 }
 
-function waitForReview(runId: string): Promise<Flow[]> {
-  return new Promise((resolve) => pendingReviews.set(runId, resolve));
+/**
+ * Plans one flow from the reviewer's plain words while the run waits at review. The flow is
+ * returned for the checklist, not added to the plan: the reviewer's submitted list is still
+ * the only thing that decides what is generated. Flows added earlier in the same review count
+ * as planned, so a second request does not come back with the first one's id.
+ */
+export async function addReviewFlow(runId: string, text: string): Promise<{ flow: Flow | null; reason?: string } | null> {
+  const gate = gates.get(runId);
+  if (gate?.node !== REVIEW_NODE) return null;
+  const out = await planRequestedFlow({ ...gate.state, plan: [...gate.state.plan, ...gate.added] }, gate.deps, text);
+  if (out.flow) gate.added.push(out.flow);
+  return { flow: out.flow, ...(out.reason ? { reason: out.reason } : {}) };
+}
+
+/**
+ * Records rulings on candidate defects. When the run is paused at confirmation and nothing
+ * is left undecided, the run resumes into its report. Rulings on a finished run are still
+ * recorded, since a partial run can end with defects nobody has looked at yet.
+ */
+export function submitVerdicts(runId: string, verdicts: VerdictSubmission["verdicts"], by: DefectVerdict["by"]): { verdicts: DefectVerdict[]; undecided: string[]; resumed: boolean } {
+  const out = recordVerdicts(runId, verdicts, by);
+  const gate = gates.get(runId);
+  if (gate?.node === CONFIRM_NODE && out.undecided.length === 0) {
+    gates.delete(runId);
+    gate.resume();
+    return { ...out, resumed: true };
+  }
+  return { ...out, resumed: false };
 }
 
 // ---------- Single-test rerun ----------
@@ -155,7 +200,11 @@ async function record(store: Store, bus: EventBus, runId: string, patch: Partial
 
 export async function startRun(
   input: StartRunInput,
-  opts: { headless?: boolean; llm?: LlmClient; store?: Store } = {},
+  opts: {
+    headless?: boolean; llm?: LlmClient; store?: Store;
+    /** Called once when a run pauses for defect confirmation, so the triage agent can ask the owner. Failures are logged, never fatal. */
+    onCandidates?: (runId: string, defects: Defect[]) => Promise<void>;
+  } = {},
 ): Promise<{ runId: string; done: Promise<RunState> }> {
   const parsed = StartRunInputSchema.parse(input);
   const store = opts.store ?? (await defaultStore());
@@ -182,7 +231,24 @@ export async function startRun(
     hasPrd: Boolean(parsed.prdText),
     status: "running",
     startedAt: state.startedAt,
+    ...(parsed.tier ? { tier: parsed.tier } : {}),
+    maxLlmCalls: parsed.budget.maxLlmCalls,
+    maxFlows: parsed.maxFlows,
   });
+
+  /**
+   * A paid-for run that never got as far as a plan gave the person nothing, so what it was
+   * paid with goes back to their wallet: a credit, never money. Best-effort, like recording.
+   */
+  const refundIfNoPlan = async (planned: boolean) => {
+    if (!parsed.tier || planned) return;
+    try {
+      await store.refundSlot(parsed.userId, parsed.tier);
+      bus.log("orchestrator", `the run ended before a plan was produced; its ${parsed.tier} run was returned to the account`);
+    } catch (err) {
+      bus.log("orchestrator", `could not refund the run: ${(err as Error).message}`);
+    }
+  };
 
   // A run whose process dies would say "running" forever. Each finished node stamps a
   // heartbeat, and the store reports a running record with a stale heartbeat as
@@ -196,28 +262,56 @@ export async function startRun(
   const config = { configurable: { thread_id: parsed.runId }, recursionLimit: 100 };
 
   /**
-   * Drives the graph to completion. `invoke` returns early when it reaches the review
-   * interrupt; the loop then parks until the reviewer submits a plan, writes that plan into
-   * the checkpoint as the review node's own output, and resumes from there. The reviewed
-   * plan is also written to disk so plan.json reflects what actually ran.
+   * Drives the graph to completion. `invoke` returns early at either approval interrupt; the
+   * loop then parks until the person acts, writes their answer into the checkpoint as the
+   * gate node's own output (which marks the node executed, so its body never runs), and
+   * resumes from there. Time spent parked is added to `pausedMs`, which the minutes budget
+   * does not count: a person reading the plan is not the run burning its allowance.
    */
+  const deps: NodeDeps = { bus, llm, headless };
   const drive = async (): Promise<RunState> => {
     let s = (await graph.invoke(state, config)) as RunState;
-    while ((await graph.getState(config)).next.includes(REVIEW_NODE)) {
-      bus.emit({ type: "node_start", node: REVIEW_NODE, data: { flows: s.plan.length } });
-      bus.log("orchestrator", `plan ready: ${s.plan.length} flows held for review`);
-      await record(store, bus, parsed.runId, { status: "awaiting_review" });
-      const plan = await waitForReview(parsed.runId);
-      await record(store, bus, parsed.runId, { status: "running" });
-      bus.log("orchestrator", `review submitted: ${plan.length} of ${s.plan.length} flows kept`);
-      writeOutput(parsed.runId, "plan.json", plan);
-      // Written as the review node's own output, which marks the node executed; the graph
-      // resumes from its outgoing edge, so the node body itself never runs.
-      await graph.updateState(config, { plan }, REVIEW_NODE);
-      bus.emit({ type: "node_end", node: REVIEW_NODE, data: { flows: plan.length } });
+    for (;;) {
+      const next = (await graph.getState(config)).next;
+      if (next.includes(REVIEW_NODE)) {
+        bus.emit({ type: "node_start", node: REVIEW_NODE, data: { flows: s.plan.length } });
+        bus.log("orchestrator", `plan ready: ${s.plan.length} flows held for review`);
+        await record(store, bus, parsed.runId, { status: "awaiting_review" });
+        const pausedAt = Date.now();
+        const plan = await new Promise<Flow[]>((resolve) => gates.set(parsed.runId, { node: REVIEW_NODE, state: s, deps, added: [], resume: resolve }));
+        await record(store, bus, parsed.runId, { status: "running" });
+        bus.log("orchestrator", `review submitted: ${plan.length} flows approved`);
+        bus.decision({ node: REVIEW_NODE, reason: `reviewer approved ${plan.length} flow(s)`, evidence: plan.map((f) => f.id), next: plan.length ? "generate" : "report", at: now() });
+        writeOutput(parsed.runId, "plan.json", plan);
+        await graph.updateState(config, { plan, pausedMs: s.pausedMs + (Date.now() - pausedAt) }, REVIEW_NODE);
+        bus.emit({ type: "node_end", node: REVIEW_NODE, data: { flows: plan.length } });
+      } else if (next.includes(CONFIRM_NODE)) {
+        bus.emit({ type: "node_start", node: CONFIRM_NODE, data: { defects: s.defects.length } });
+        // Written now rather than by the report, so the confirmation screen and the triage
+        // agent have the candidates to read while the run waits on them.
+        writeOutput(parsed.runId, "defects.json", s.defects);
+        const pausedAt = Date.now();
+        if (undecided(s.defects, readVerdicts(parsed.runId)).length > 0) {
+          bus.log("orchestrator", `${s.defects.length} candidate defect(s) waiting for confirmation`);
+          await record(store, bus, parsed.runId, { status: "awaiting_confirmation" });
+          try {
+            await opts.onCandidates?.(parsed.runId, s.defects);
+          } catch (err) {
+            bus.log("orchestrator", `could not hand the candidates to the triage agent: ${(err as Error).message}`);
+          }
+          await new Promise<void>((resolve) => gates.set(parsed.runId, { node: CONFIRM_NODE, state: s, resume: resolve }));
+          await record(store, bus, parsed.runId, { status: "running" });
+        }
+        const verdicts = readVerdicts(parsed.runId);
+        const confirmed = verdicts.filter((v) => v.verdict === "confirmed").map((v) => v.defectId);
+        bus.decision({ node: CONFIRM_NODE, reason: `${confirmed.length} of ${s.defects.length} candidate defect(s) confirmed`, evidence: verdicts.map((v) => `${v.defectId}: ${v.verdict} (${v.by})`), next: "report", at: now() });
+        await graph.updateState(config, { pausedMs: s.pausedMs + (Date.now() - pausedAt) }, CONFIRM_NODE);
+        bus.emit({ type: "node_end", node: CONFIRM_NODE, data: { confirmed: confirmed.length } });
+      } else {
+        return s;
+      }
       s = (await graph.invoke(null, config)) as RunState;
     }
-    return s;
   };
 
   const done = drive()
@@ -229,12 +323,13 @@ export async function startRun(
       disposeScreencast(parsed.runId);
       runContexts.set(parsed.runId, { url: s.url, loginSteps: s.siteMap?.loginSteps ?? [] });
       await record(store, bus, parsed.runId, summarise(s, state.startedAt));
+      await refundIfNoPlan(s.planIterations > 0);
       return s;
     })
     .catch(async (err: Error) => {
       unsubscribe();
       disposeScreencast(parsed.runId);
-      pendingReviews.delete(parsed.runId);
+      gates.delete(parsed.runId);
       const finishedAt = new Date().toISOString();
       await record(store, bus, parsed.runId, {
         status: "failed",
@@ -242,6 +337,7 @@ export async function startRun(
         durationMs: Date.parse(finishedAt) - Date.parse(state.startedAt),
         partialReason: err.message,
       });
+      await refundIfNoPlan(false);
       bus.emit({ type: "error", message: err.message });
       bus.emit({ type: "done", message: "failed" });
       throw err;

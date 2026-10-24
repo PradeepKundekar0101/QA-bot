@@ -150,15 +150,21 @@ export function runProgress(rows: CaseRow[]): RunProgress {
 }
 
 /** Whether the run is parked at the plan-review gate: the review node has started and not ended. */
-export function isAwaitingReview(events: RunEvent[]): boolean {
+/** Whether the run is parked at a gate node: started and not yet ended. */
+function isWaitingAt(events: RunEvent[], node: string): boolean {
   let waiting = false;
   for (const e of events) {
-    if (e.node !== "review") continue;
+    if (e.node !== node) continue;
     if (e.type === "node_start") waiting = true;
     if (e.type === "node_end") waiting = false;
   }
   return waiting;
 }
+
+export const isAwaitingReview = (events: RunEvent[]) => isWaitingAt(events, "review");
+
+/** Parked while the owner rules on the candidate defects. */
+export const isAwaitingConfirmation = (events: RunEvent[]) => isWaitingAt(events, "await_defect_confirmation");
 
 export function isDoneEvents(events: RunEvent[]): boolean {
   return events.some((e) => e.type === "done");

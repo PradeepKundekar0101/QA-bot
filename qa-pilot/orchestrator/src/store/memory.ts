@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { CHAT_MESSAGE_CAP, EmailTakenError, RunIdTakenError, TicketTakenError, normaliseEmail, withDerivedStatus, type ChatRecord, type ChatSummary, type IntegrationRecord, type RunRecord, type Store, type TicketRecord, type User } from "./types.js";
+import { CHAT_MESSAGE_CAP, EmailTakenError, RunIdTakenError, TicketTakenError, normaliseEmail, withDerivedStatus, type ChatRecord, type ChatSummary, type IntegrationRecord, type RunRecord, type Store, type PaymentRecord, type TicketRecord, type User, type Wallet } from "./types.js";
 
 /**
  * The `Store` over plain Maps. Used by every test that is not specifically testing Mongo,
@@ -26,6 +26,9 @@ export function memoryStore(): Store {
   const chats = new Map<string, ChatRecord>();
   const integrations = new Map<string, IntegrationRecord>();
   const tickets = new Map<string, TicketRecord>();
+  const wallets = new Map<string, Wallet>();
+  const payments = new Map<string, PaymentRecord>();
+  const wallet = (userId: string): Wallet => wallets.get(userId) ?? { freeRunUsed: false, paidCredits: 0 };
   const ticketKey = (userId: string, runId: string, testId: string) => `${userId}/${runId}/${testId}`;
 
   return {
@@ -146,6 +149,48 @@ export function memoryStore(): Store {
         .filter((t) => t.userId === userId && t.runId === runId)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
         .map((t) => ({ ...t }));
+    },
+
+    async getWallet(userId) {
+      return { ...wallet(userId) };
+    },
+    // Synchronous bodies, so each claim is atomic on the event loop the way Mongo's
+    // conditional update is atomic on the server.
+    async claimRunSlot(userId) {
+      const w = wallet(userId);
+      if (!w.freeRunUsed) { wallets.set(userId, { ...w, freeRunUsed: true }); return "free"; }
+      if (w.paidCredits > 0) { wallets.set(userId, { ...w, paidCredits: w.paidCredits - 1 }); return "paid"; }
+      return null;
+    },
+    async grantCredits(userId, n) {
+      const w = wallet(userId);
+      wallets.set(userId, { ...w, paidCredits: w.paidCredits + n });
+    },
+    async refundSlot(userId, tier) {
+      const w = wallet(userId);
+      wallets.set(userId, tier === "free" ? { ...w, freeRunUsed: false } : { ...w, paidCredits: w.paidCredits + 1 });
+    },
+
+    async insertPayment(rec) {
+      payments.set(rec.id, { ...rec });
+    },
+    async updatePayment(id, patch) {
+      const cur = payments.get(id);
+      if (cur) payments.set(id, { ...cur, ...patch });
+    },
+    async getPayment(id) {
+      const rec = payments.get(id);
+      return rec ? { ...rec } : null;
+    },
+    async findPaymentByOrder(orderId) {
+      for (const p of payments.values()) if (p.orderId === orderId) return { ...p };
+      return null;
+    },
+    async markPaymentPaid(id) {
+      const cur = payments.get(id);
+      if (!cur || cur.status === "paid") return false;
+      payments.set(id, { ...cur, status: "paid", paidAt: new Date().toISOString() });
+      return true;
     },
 
     async close() { /* nothing to release */ },

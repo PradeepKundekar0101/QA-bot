@@ -1,13 +1,14 @@
 import { z } from "zod";
 import { BrowserToolkit } from "../browser/toolkit.js";
 import { findNearTwins, parseSnapshot } from "../browser/snapshot.js";
-import { outputDir, type Classification, type Defect, type Flow, type RunState, type RunUpdate, type TestResult } from "../state.js";
+import { DEFECT_LOOK_THRESHOLD, outputDir, type Classification, type Defect, type Flow, type RunState, type RunUpdate, type TestResult } from "../state.js";
 import { makeDefect } from "./defects.js";
 import { now, type NodeDeps } from "./deps.js";
 
-export const RationaleSchema = z.object({ rationale: z.string(), confidence_adjustment: z.number().min(-0.1).max(0.1) });
+export const RationaleSchema = z.object({ rationale: z.string(), confidence_adjustment: z.number().min(-0.2).max(0.2) });
 export const MAX_HEAL_ATTEMPTS = 2;
-export const MAX_RERUNS = 2;
+/** A flaky or mid-band failure is rerun once; a second failure is its answer. */
+export const MAX_RERUNS = 1;
 
 export type Evidence = {
   test: TestResult;
@@ -16,6 +17,8 @@ export type Evidence = {
   controlPassed: boolean | null;
   sameLocatorFailures: number;
   previousStatus?: TestResult["status"];
+  /** The page at the point of failure, captured while replaying; absent when the capture was skipped. */
+  screenshot?: string;
 };
 type Class = "script" | "defect" | "flaky" | "env";
 
@@ -126,20 +129,25 @@ function sharesWords(a: string, b: string): boolean {
   return inter > 0 && inter / Math.max(ta.size, tb.size) >= 0.4;
 }
 
-/** The reviewer may nudge a mid-band (0.5 to 0.8) confidence by up to 0.1; confident and weak verdicts stand as the rules scored them. */
+/** The reviewer may nudge a mid-band (0.5 to 0.8) confidence by up to 0.2; confident and weak verdicts stand as the rules scored them. */
 export function adjustConfidence(confidence: number, adjustment: number): number {
   const adjusted = confidence >= 0.5 && confidence < 0.8 ? confidence + adjustment : confidence;
   return Math.round(Math.max(0, Math.min(1, adjusted)) * 100) / 100;
 }
 
-export function classifyOne(e: Evidence, healAttempts: number, rerunAttempts: number): Classification {
+/**
+ * With `autoHeal` off a script failure is reported as a test that needs a fix and is never
+ * patched: on a web run, applying a fix is the person's decision, not the pipeline's.
+ */
+export function classifyOne(e: Evidence, healAttempts: number, rerunAttempts: number, opts: { autoHeal?: boolean } = {}): Classification {
+  const canHeal = (opts.autoHeal ?? true) && healAttempts < MAX_HEAL_ATTEMPTS;
   const { weights, evidence } = scoreSignals(e);
   const [cls, raw] = (Object.entries(weights) as [Class, number][]).sort((a, b) => b[1] - a[1])[0];
   const confidence = Math.min(1, Math.round(raw * 100) / 100);
   if (confidence < 0.5) return { test: e.test.id, class: "needs_human", confidence, evidence: [...evidence, "confidence below 0.5"], action: "needs_human" };
   if (confidence < 0.8 && rerunAttempts < MAX_RERUNS && e.test.status !== "passed") return { test: e.test.id, class: cls, confidence, evidence: [...evidence, "confidence in 0.5-0.8 band: rerun and control test first"], action: "rerun" };
   switch (cls) {
-    case "script": return { test: e.test.id, class: cls, confidence, evidence, action: healAttempts < MAX_HEAL_ATTEMPTS ? "heal" : "escalate" };
+    case "script": return { test: e.test.id, class: cls, confidence, evidence, action: canHeal ? "heal" : "escalate" };
     case "defect": return { test: e.test.id, class: cls, confidence, evidence, action: "escalate" };
     case "flaky": return { test: e.test.id, class: cls, confidence, evidence, action: rerunAttempts < MAX_RERUNS ? "rerun" : "escalate" };
     case "env": return { test: e.test.id, class: cls, confidence, evidence, action: "stop" };
@@ -154,6 +162,7 @@ async function gatherEvidence(state: RunState, deps: NodeDeps, failed: TestResul
     for (const test of failed) {
       const flow = state.plan.find((f) => f.id === test.id)!;
       let snapshot = "";
+      let screenshot = "";
       // A failure on an expect line happened after every step ran, so the whole flow is replayed.
       const replayTo = test.failingStep ?? (test.failingExpect !== undefined ? flow.steps.length : undefined);
       if (replayTo !== undefined) {
@@ -162,7 +171,7 @@ async function gatherEvidence(state: RunState, deps: NodeDeps, failed: TestResul
           if (flow.preconditions.includes("logged_in")) for (const s of state.siteMap?.loginSteps ?? []) await kit.act(page, s);
           for (let i = 0; i < replayTo; i++) await kit.act(page, flow.steps[i]);
           snapshot = await kit.snapshot(page);
-          await kit.screenshot(page, `failure ${test.id}`);
+          screenshot = await kit.screenshot(page, `failure ${test.id}`, { evidence: true });
         } finally {
           await page.close();
         }
@@ -170,7 +179,7 @@ async function gatherEvidence(state: RunState, deps: NodeDeps, failed: TestResul
       const control = state.results!.tests.find((t) => t.id !== test.id && state.plan.find((f) => f.id === t.id)?.category === "happy" && sameArea(flow, state.plan.find((f) => f.id === t.id)!));
       const failingName = test.failingStep !== undefined ? flow.steps[test.failingStep]?.name : undefined;
       const sameLocatorFailures = failingName ? failed.filter((t) => t.id !== test.id && t.failingStep !== undefined && state.plan.find((f) => f.id === t.id)?.steps[t.failingStep!]?.name === failingName).length + 1 : 0;
-      out.push({ test, flow, snapshotAtFailure: snapshot, controlPassed: control ? control.status === "passed" : null, sameLocatorFailures, previousStatus: previous.get(test.id) ? "failed" : undefined });
+      out.push({ test, flow, snapshotAtFailure: snapshot, controlPassed: control ? control.status === "passed" : null, sameLocatorFailures, previousStatus: previous.get(test.id) ? "failed" : undefined, ...(screenshot ? { screenshot } : {}) });
     }
   } finally {
     await kit.close();
@@ -204,7 +213,7 @@ export async function classifyNode(state: RunState, deps: NodeDeps): Promise<Run
       classifications.push({ test: e.test.id, class: "defect", confidence: previous.get(e.test.id)?.confidence ?? 1, evidence: [`already escalated as ${ticket.id}`], action: "escalate" });
       continue;
     }
-    const c = classifyOne(e, state.healAttempts[e.test.id] ?? 0, state.rerunAttempts[e.test.id] ?? 0);
+    const c = classifyOne(e, state.healAttempts[e.test.id] ?? 0, state.rerunAttempts[e.test.id] ?? 0, { autoHeal: state.autoHeal });
     if (e.test.status === "passed") {
       const heal = state.healLog.find((h) => h.test === e.test.id && h.accepted);
       classifications.push(
@@ -229,15 +238,22 @@ export async function classifyNode(state: RunState, deps: NodeDeps): Promise<Run
     }
     deps.bus.emit({ type: "test_result", message: `${e.test.id} classified ${c.class} ${c.confidence}`, data: classifications[classifications.length - 1] });
   }
+  const shots = new Map(evidence.filter((e) => e.screenshot).map((e) => [e.test.id, e.screenshot!]));
   const defects: Defect[] = classifications
     .filter((c) => c.class === "defect" && c.action === "escalate" && !ticketed.has(c.test))
-    .map((c) => makeDefect(state, c.test, tests.find((t) => t.id === c.test)?.error ?? "see evidence", c.evidence));
-  for (const d of defects) deps.bus.decision({ node: "classify", reason: `escalating ${d.flow} as ${d.severity} defect`, evidence: d.evidence, next: "ticket", at: now() });
+    .map((c, i) => ({
+      ...makeDefect(state, c.test, tests.find((t) => t.id === c.test)?.error ?? "see evidence", c.evidence, state.defects.length + i + 1),
+      confidence: c.confidence,
+      needsLook: c.confidence < DEFECT_LOOK_THRESHOLD,
+      ...(shots.get(c.test) ? { screenshot: shots.get(c.test) } : {}),
+      ...(c.rationale ? { rationale: c.rationale } : {}),
+    }));
+  for (const d of defects) deps.bus.decision({ node: "classify", reason: `escalating ${d.flow} as a ${d.severity} candidate defect`, evidence: d.evidence, next: "await_defect_confirmation", at: now() });
   deps.bus.emit({ type: "node_end", node: "classify", data: { failed: failed.length, defects: defects.length } });
   return { classifications, defects, llmCalls };
 }
 
-export function afterClassify(state: RunState, deps: NodeDeps): "heal" | "rerun" | "report" {
+export function afterClassify(state: RunState, deps: NodeDeps): "heal" | "rerun" | "confirm" | "report" {
   const cs = state.classifications;
   const toHeal = cs.filter((c) => c.action === "heal");
   const toRerun = cs.filter((c) => c.action === "rerun");
@@ -252,6 +268,10 @@ export function afterClassify(state: RunState, deps: NodeDeps): "heal" | "rerun"
   if (toRerun.length) {
     deps.bus.decision({ node: "classify", reason: `${toRerun.length} test(s) need a rerun to confirm`, evidence: toRerun.map((c) => `${c.test}: ${c.class} ${c.confidence}`), next: "run", at: now() });
     return "rerun";
+  }
+  if (state.defects.length > 0) {
+    deps.bus.decision({ node: "classify", reason: `${state.defects.length} candidate defect(s) held for a person to confirm before anything is filed`, evidence: state.defects.map((d) => `${d.id}: confidence ${d.confidence ?? "unknown"}${d.needsLook ? ", needs a look" : ""}`), next: "await_defect_confirmation", at: now() });
+    return "confirm";
   }
   deps.bus.decision({ node: "classify", reason: cs.length ? "all failures classified; nothing left to heal or rerun" : "all tests passed", evidence: cs.map((c) => `${c.test}: ${c.class} ${c.confidence} -> ${c.action}`), next: "report", at: now() });
   return "report";

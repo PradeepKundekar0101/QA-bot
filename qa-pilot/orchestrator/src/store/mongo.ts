@@ -1,6 +1,6 @@
 import { MongoClient, type Collection, type Db, type Filter } from "mongodb";
 import { randomUUID } from "node:crypto";
-import { CHAT_MESSAGE_CAP, EmailTakenError, RunIdTakenError, TicketTakenError, normaliseEmail, withDerivedStatus, type ChatRecord, type ChatSummary, type IntegrationRecord, type RunRecord, type Store, type TicketRecord, type User } from "./types.js";
+import { CHAT_MESSAGE_CAP, EmailTakenError, RunIdTakenError, TicketTakenError, normaliseEmail, withDerivedStatus, type ChatRecord, type ChatSummary, type IntegrationRecord, type RunRecord, type Store, type PaymentRecord, type TicketRecord, type User, type Wallet } from "./types.js";
 
 type UserDoc = { _id: string; email: string; passwordHash: string; createdAt: string };
 type SessionDoc = { _id: string; userId: string; createdAt: string; expiresAt: Date };
@@ -9,6 +9,9 @@ type ChatDoc = Omit<ChatRecord, "id" | "kind"> & { _id: string; kind?: ChatRecor
 /** Keyed by user: one tracker connection each, so a save is a replace. */
 type IntegrationDoc = Omit<IntegrationRecord, "userId"> & { _id: string };
 type TicketDoc = Omit<TicketRecord, "id"> & { _id: string };
+/** Keyed by user. Absent until the account first claims, buys or is refunded a run. */
+type WalletDoc = Partial<Wallet> & { _id: string };
+type PaymentDoc = Omit<PaymentRecord, "id"> & { _id: string };
 
 const DUPLICATE_KEY = 11000;
 /** Case-insensitive comparison for the unique email index and for lookups. */
@@ -107,6 +110,7 @@ async function ensureIndexes(db: Db): Promise<void> {
   await db.collection<RunDoc>("runs").createIndex({ userId: 1, startedAt: -1 }, { name: "runs_by_user_recent" });
   await db.collection<ChatDoc>("chats").createIndex({ userId: 1, updatedAt: -1 }, { name: "chats_by_user_recent" });
   // The index is what makes a double-filed ticket impossible, not the pre-check in the route.
+  await db.collection<PaymentDoc>("payments").createIndex({ orderId: 1 }, { sparse: true, name: "payment_by_order" });
   await db.collection<TicketDoc>("tickets").createIndex({ userId: 1, runId: 1, testId: 1 }, { unique: true, name: "ticket_per_test" });
 }
 
@@ -140,6 +144,8 @@ export async function mongoStore(opts: { url?: string; db?: string } = {}): Prom
   const chats: Collection<ChatDoc> = db.collection("chats");
   const integrations: Collection<IntegrationDoc> = db.collection("integrations");
   const tickets: Collection<TicketDoc> = db.collection("tickets");
+  const wallets: Collection<WalletDoc> = db.collection("wallets");
+  const payments: Collection<PaymentDoc> = db.collection("payments");
 
   return {
     async createUser(email, passwordHash) {
@@ -286,6 +292,56 @@ export async function mongoStore(opts: { url?: string; db?: string } = {}): Prom
     async listTickets(userId, runId) {
       const docs = await tickets.find({ userId, runId }).sort({ createdAt: 1 }).toArray();
       return docs.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
+    },
+
+    async getWallet(userId) {
+      const doc = await wallets.findOne({ _id: userId });
+      return { freeRunUsed: doc?.freeRunUsed ?? false, paidCredits: doc?.paidCredits ?? 0 };
+    },
+    async claimRunSlot(userId) {
+      // The free run: an upsert conditional on it being unused. When the wallet exists with
+      // the free run spent, the filter misses and the upsert collides on _id, which is the
+      // "already used" answer, not an error.
+      try {
+        const res = await wallets.updateOne({ _id: userId, freeRunUsed: { $ne: true } }, { $set: { freeRunUsed: true } }, { upsert: true });
+        if (res.modifiedCount === 1 || res.upsertedCount === 1) return "free";
+      } catch (err) {
+        if ((err as { code?: number }).code !== DUPLICATE_KEY) throw err;
+      }
+      const paid = await wallets.updateOne({ _id: userId, paidCredits: { $gt: 0 } }, { $inc: { paidCredits: -1 } });
+      return paid.modifiedCount === 1 ? "paid" : null;
+    },
+    async grantCredits(userId, n) {
+      await wallets.updateOne({ _id: userId }, { $inc: { paidCredits: n } }, { upsert: true });
+    },
+    async refundSlot(userId, tier) {
+      await wallets.updateOne({ _id: userId }, tier === "free" ? { $set: { freeRunUsed: false } } : { $inc: { paidCredits: 1 } }, { upsert: true });
+    },
+
+    async insertPayment(rec) {
+      const { id, ...rest } = rec;
+      await payments.insertOne({ _id: id, ...rest });
+    },
+    async updatePayment(id, patch) {
+      const fields = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+      if (Object.keys(fields).length) await payments.updateOne({ _id: id }, { $set: fields });
+    },
+    async getPayment(id) {
+      const doc = await payments.findOne({ _id: id });
+      if (!doc) return null;
+      const { _id, ...rest } = doc;
+      return { id: _id, ...rest };
+    },
+    async findPaymentByOrder(orderId) {
+      const doc = await payments.findOne({ orderId });
+      if (!doc) return null;
+      const { _id, ...rest } = doc;
+      return { id: _id, ...rest };
+    },
+    async markPaymentPaid(id) {
+      // Conditional on not being paid yet, so of two concurrent deliveries exactly one moves it.
+      const res = await payments.updateOne({ _id: id, status: { $ne: "paid" } }, { $set: { status: "paid", paidAt: new Date().toISOString() } });
+      return res.modifiedCount === 1;
     },
 
     async close() {

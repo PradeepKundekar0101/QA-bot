@@ -1,8 +1,13 @@
+import type { Tier } from "../billing/tiers.js";
+
 /** How long a `running` run may go without a heartbeat before it reads as interrupted. */
 export const STALE_HEARTBEAT_MS = 5 * 60_000;
 
-/** `awaiting_review` is a run paused at the plan-review gate; it has no heartbeat and never reads as interrupted. */
-export type RunStatus = "running" | "awaiting_review" | "done" | "partial" | "failed" | "interrupted";
+/**
+ * `awaiting_review` and `awaiting_confirmation` are runs paused at a human gate (the plan
+ * review, the defect confirmation); they have no heartbeat and never read as interrupted.
+ */
+export type RunStatus = "running" | "awaiting_review" | "awaiting_confirmation" | "done" | "partial" | "failed" | "interrupted";
 
 export type User = { id: string; email: string; createdAt: string };
 
@@ -55,9 +60,6 @@ export type RunDraft = {
   prdText?: string;
   prdName?: string;
   requiresSignIn?: boolean;
-  maxFlows?: number;
-  budget?: { maxLlmCalls?: number; maxMinutes?: number };
-  reviewPlan?: boolean;
 };
 
 export type ChatRecord = {
@@ -111,7 +113,31 @@ export type RunRecord = {
   defectsCount?: number;
   llmCalls?: number;
   partialReason?: string;
+  /** What the run was paid with. Absent on runs recorded before tiers existed and on CLI runs. */
+  tier?: Tier;
+  /** The run's LLM-call cap, so a summary can show usage against the run's own limit. */
+  maxLlmCalls?: number;
+  /** How many flows the run may generate, which also caps what a reviewer can approve. */
+  maxFlows?: number;
 };
+
+/**
+ * One checkout for one paid run. `id` is our merchant order reference; `orderId` is the
+ * gateway's, known once the order is created. `paid` is set exactly once, and that transition
+ * is what grants the credit, so a webhook delivered twice cannot pay out twice.
+ */
+export type PaymentRecord = {
+  id: string;
+  userId: string;
+  amountPaisa: number;
+  status: "created" | "paid" | "failed";
+  orderId?: string;
+  createdAt: string;
+  paidAt?: string;
+};
+
+/** What an account can still start runs with. */
+export type Wallet = { freeRunUsed: boolean; paidCredits: number };
 
 export type TrackerProvider = "linear" | "jira";
 
@@ -218,6 +244,25 @@ export interface Store {
   insertTicket(rec: TicketRecord): Promise<void>;
   findTicket(userId: string, runId: string, testId: string): Promise<TicketRecord | null>;
   listTickets(userId: string, runId: string): Promise<TicketRecord[]>;
+
+  /** An account that has never been seen reads as a fresh wallet: free run unused, no credits. */
+  getWallet(userId: string): Promise<Wallet>;
+  /**
+   * Atomically takes what the next run is paid with: the free run while it is unused, else
+   * one paid credit, else null. Atomic so two tabs starting at once cannot both get the
+   * free run.
+   */
+  claimRunSlot(userId: string): Promise<Tier | null>;
+  grantCredits(userId: string, n: number): Promise<void>;
+  /** Gives back what `claimRunSlot` took, for a run that failed before it produced a plan. */
+  refundSlot(userId: string, tier: Tier): Promise<void>;
+
+  insertPayment(rec: PaymentRecord): Promise<void>;
+  updatePayment(id: string, patch: Partial<Pick<PaymentRecord, "orderId" | "status">>): Promise<void>;
+  getPayment(id: string): Promise<PaymentRecord | null>;
+  findPaymentByOrder(orderId: string): Promise<PaymentRecord | null>;
+  /** Moves a payment to `paid` and answers true only for the call that made the move. */
+  markPaymentPaid(id: string): Promise<boolean>;
 
   close(): Promise<void>;
 }

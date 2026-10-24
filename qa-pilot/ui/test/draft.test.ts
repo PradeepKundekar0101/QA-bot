@@ -20,11 +20,6 @@ describe("applyPatch", () => {
     expect(next.intent).toBe("auth and checkout");
   });
 
-  it("merges a partial budget over the current one rather than replacing it", () => {
-    const draft: RunDraft = { ...DEFAULT_DRAFT, budget: { maxLlmCalls: 200, maxMinutes: 40 } };
-    expect(applyPatch(draft, { budget: { maxMinutes: 15 } }).budget).toEqual({ maxLlmCalls: 200, maxMinutes: 15 });
-  });
-
   it("clears the credentials when sign-in is turned back off, so they cannot be sent unseen", () => {
     const draft: RunDraft = { ...DEFAULT_DRAFT, requiresSignIn: true, username: "demo", password: "pw" };
     const next = applyPatch(draft, { requiresSignIn: false });
@@ -41,11 +36,6 @@ describe("changedFields", () => {
   it("names the fields a patch actually moved, so only those flash", () => {
     const draft: RunDraft = { ...DEFAULT_DRAFT, url: "https://a.test", intent: "checkout" };
     expect(changedFields(draft, applyPatch(draft, { intent: "auth", url: "https://a.test" }))).toEqual(["intent"]);
-  });
-
-  it("reports a budget change once, under one name", () => {
-    const draft: RunDraft = { ...DEFAULT_DRAFT };
-    expect(changedFields(draft, applyPatch(draft, { budget: { maxMinutes: 15 } }))).toEqual(["budget"]);
   });
 
   it("is empty when a patch changes nothing", () => {
@@ -75,14 +65,9 @@ describe("snapshotOf", () => {
 
 describe("runInputFromDraft", () => {
   it("builds what POST /run expects", () => {
-    const draft: RunDraft = {
-      ...DEFAULT_DRAFT, url: "https://a.test", intent: "checkout", prdText: "# PRD",
-      reviewPlan: true, maxFlows: 8, budget: { maxLlmCalls: 150, maxMinutes: 20 },
-    };
-    expect(runInputFromDraft(draft, "chat-1")).toEqual({
-      url: "https://a.test", intent: "checkout", prd: "# PRD", reviewPlan: true,
-      maxFlows: 8, budget: { maxLlmCalls: 150, maxMinutes: 20 }, chatId: "chat-1",
-    });
+    const draft: RunDraft = { ...DEFAULT_DRAFT, url: "https://a.test", intent: "checkout", prdText: "# PRD" };
+    // No flow cap, budget or review flag: the server sets those from the account's tier.
+    expect(runInputFromDraft(draft, "chat-1")).toEqual({ url: "https://a.test", intent: "checkout", prd: "# PRD", chatId: "chat-1" });
   });
 
   it("sends the credentials only when sign-in is on and both halves are filled", () => {

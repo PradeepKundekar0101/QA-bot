@@ -181,6 +181,22 @@ describe("screenshots never fail an agent", () => {
       await shots.close();
     }
   });
+
+  it("throttles step pictures but never an evidence capture", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const shots = await BrowserToolkit.launch({ headless: true, baseUrl: shop.base, screenshotDir: mkdtempSync(join(tmpdir(), "qa-shots-")) });
+    try {
+      const page = await shots.newPage();
+      await page.goto(shop.base + "/login");
+      expect(await shots.screenshot(page, "step one")).not.toBe("");
+      expect(await shots.screenshot(page, "step two")).toBe("");
+      expect(await shots.screenshot(page, "failure x", { evidence: true })).toMatch(/failure-x\.png$/);
+    } finally {
+      await shots.close();
+    }
+  });
 });
 
 describe("checkExpectation on pages with repeated elements", () => {

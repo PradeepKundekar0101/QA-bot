@@ -7,7 +7,8 @@ export const PrdRequirementsSchema = z.object({ requirements: z.array(z.string()
 export const PrdMatrixSchema = z.object({ matrix: z.array(z.object({ requirement: z.string(), flow_ids: z.array(z.string()) })) });
 
 export const COVERAGE_THRESHOLD = 0.75;
-export const MAX_PLAN_ITERATIONS = 3;
+/** The first plan plus at most one re-plan with the gap list. */
+export const MAX_PLAN_ITERATIONS = 2;
 
 type Gap = CoverageVerdict["gaps"][number];
 

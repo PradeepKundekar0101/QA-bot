@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  areaOf, caseRows, statusCounts, groupByUseCase, filterRows, runProgress, isAwaitingReview, activeNode,
+  areaOf, caseRows, statusCounts, groupByUseCase, filterRows, runProgress, isAwaitingReview, isAwaitingConfirmation, activeNode,
   artifactRel, latestScreenshotBy, stepLabel, expectationLabel, describeFlow, stepStates, type Flow,
 } from "@/lib/cases";
 import type { RunEvent } from "@/lib/events";
@@ -106,6 +106,13 @@ describe("run state helpers", () => {
     expect(isAwaitingReview([ev({ type: "node_start", node: "review" })])).toBe(true);
     expect(isAwaitingReview([ev({ type: "node_start", node: "review" }), ev({ type: "node_end", node: "review" })])).toBe(false);
     expect(isAwaitingReview([])).toBe(false);
+  });
+
+  it("detects the defect confirmation gate, separately from review", () => {
+    const paused = [ev({ type: "node_start", node: "review" }), ev({ type: "node_end", node: "review" }), ev({ type: "node_start", node: "await_defect_confirmation" })];
+    expect(isAwaitingConfirmation(paused)).toBe(true);
+    expect(isAwaitingReview(paused)).toBe(false);
+    expect(isAwaitingConfirmation([...paused, ev({ type: "node_end", node: "await_defect_confirmation" })])).toBe(false);
   });
 
   it("tracks the active node", () => {

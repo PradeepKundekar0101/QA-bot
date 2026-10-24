@@ -249,6 +249,48 @@ describe.each(factories)("store contract (%s)", (_name, make) => {
     expect(await store.listTickets("u1", "run-2")).toEqual([]);
     await expect(store.insertTicket({ ...t, id: "t3" })).rejects.toBeInstanceOf(TicketTakenError);
   });
+
+  it("gives an account one free run, then spends paid credits, then nothing", async () => {
+    expect(await store.getWallet("u1")).toEqual({ freeRunUsed: false, paidCredits: 0 });
+    expect(await store.claimRunSlot("u1")).toBe("free");
+    expect(await store.claimRunSlot("u1")).toBeNull();
+    await store.grantCredits("u1", 2);
+    expect(await store.getWallet("u1")).toEqual({ freeRunUsed: true, paidCredits: 2 });
+    expect(await store.claimRunSlot("u1")).toBe("paid");
+    expect(await store.claimRunSlot("u1")).toBe("paid");
+    expect(await store.claimRunSlot("u1")).toBeNull();
+    // Another account's wallet is untouched.
+    expect(await store.claimRunSlot("u2")).toBe("free");
+  });
+
+  it("hands out a free run only once under concurrent claims", async () => {
+    const claims = await Promise.all([store.claimRunSlot("u1"), store.claimRunSlot("u1"), store.claimRunSlot("u1")]);
+    expect(claims.filter((c) => c === "free")).toHaveLength(1);
+    expect(claims.filter((c) => c === null)).toHaveLength(2);
+  });
+
+  it("records a checkout, marks it paid exactly once, and finds it by either reference", async () => {
+    await store.insertPayment({ id: "pay-1", userId: "u1", amountPaisa: 9900, status: "created", createdAt: "2026-10-24T10:00:00.000Z" });
+    await store.updatePayment("pay-1", { orderId: "ord-9" });
+    expect(await store.getPayment("pay-1")).toMatchObject({ userId: "u1", orderId: "ord-9", status: "created" });
+    expect((await store.findPaymentByOrder("ord-9"))?.id).toBe("pay-1");
+    const marks = await Promise.all([store.markPaymentPaid("pay-1"), store.markPaymentPaid("pay-1")]);
+    expect(marks.filter(Boolean)).toHaveLength(1);
+    expect((await store.getPayment("pay-1"))?.status).toBe("paid");
+    expect(await store.markPaymentPaid("pay-404")).toBe(false);
+    expect(await store.getPayment("pay-404")).toBeNull();
+  });
+
+  it("refunds a slot as a credit of the same kind", async () => {
+    expect(await store.claimRunSlot("u1")).toBe("free");
+    await store.refundSlot("u1", "free");
+    expect(await store.getWallet("u1")).toEqual({ freeRunUsed: false, paidCredits: 0 });
+    await store.grantCredits("u1", 1);
+    expect(await store.claimRunSlot("u1")).toBe("free");
+    expect(await store.claimRunSlot("u1")).toBe("paid");
+    await store.refundSlot("u1", "paid");
+    expect(await store.getWallet("u1")).toEqual({ freeRunUsed: true, paidCredits: 1 });
+  });
 });
 
 afterAll(async () => {

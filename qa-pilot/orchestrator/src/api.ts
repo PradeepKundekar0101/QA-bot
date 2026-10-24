@@ -12,6 +12,7 @@ import { getScreencast, type Frame } from "./browser/screencast.js";
 import { outputDir, RunInputSchema, CredentialsSchema, type StartRunInput, type Step, type TestResult } from "./state.js";
 import {
   startRun, newRunId, submitReview, awaitingReview, rerunTest, rerunBlocker, ReviewSubmissionSchema,
+  AddFlowSchema, addReviewFlow, submitVerdicts, awaitingConfirmation, reviewFlowCap,
   contextLoginSteps as liveLoginSteps, needsLogin, rerunTests as runRerunTests, specPath,
 } from "./run.js";
 import { defaultStore } from "./store/index.js";
@@ -28,14 +29,20 @@ import { requireUser, type AuthEnv } from "./auth/middleware.js";
 import { artifactManifest } from "./runs/manifest.js";
 import { readSuite } from "./suite/bundle.js";
 import { liveTrackerClient, publicShape, TrackerError, type TrackerClient } from "./integrations/index.js";
-import { buildTicket } from "./integrations/ticket.js";
-import type { Defect, Flow, RunResults } from "./state.js";
-import { readOutput } from "./output.js";
+import { fileTicket } from "./integrations/file.js";
+import { agentAuthorized, handleMcp } from "./triage/mcp.js";
+import { readTriageLog, type TriageDeps } from "./triage/tools.js";
+import { triageHandoff } from "./triage/agenticorg.js";
 import { zip } from "./suite/zip.js";
+import { PAID_RUN_PAISA, TIERS } from "./billing/tiers.js";
+import { parseWebhook, pineLabsClient, pineLabsFromEnv, verifyWebhook, type PineLabsClient } from "./billing/pinelabs.js";
+import { readDefects, readVerdicts, UnknownDefectError, VerdictSubmissionSchema } from "./defects/verdicts.js";
 
 // userId is not part of RunInputSchema (Ruling 1), so there is nothing to omit for it here;
 // the handler supplies it from the session when it builds the StartRunInput.
-const BodySchema = RunInputSchema.omit({ runId: true, prdText: true }).extend({
+// The budget, flow cap, review gate and healing are the server's to set from the account's
+// tier, so the fields a client might send for them are not part of the body at all.
+const BodySchema = RunInputSchema.omit({ runId: true, prdText: true, maxFlows: true, budget: true, reviewPlan: true, autoHeal: true }).extend({
   prd: z.string().optional(),
   /** The chat this run was configured in, so the conversation can link to what it produced. */
   chatId: z.string().optional(),
@@ -61,7 +68,6 @@ const CopilotExecuteSchema = z.object({ credentials: CredentialsSchema.optional(
 const executing = new Set<string>();
 
 /** Tickets being filed, keyed by run and test, so a double click cannot reach the tracker twice. */
-const filing = new Set<string>();
 
 /** Where the UI lives, for the link a ticket carries back to the case page and the OAuth return. */
 const UI_ORIGIN = process.env.QA_PILOT_UI_ORIGIN ?? "http://localhost:3000";
@@ -76,16 +82,6 @@ const DestinationSchema = z.object({ id: z.string().min(1) });
 /** Only a path on the UI may be returned to after OAuth, never another origin. */
 function safeReturn(raw: string | undefined | null): string | undefined {
   return raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : undefined;
-}
-
-function readJsonOutput<T>(runId: string, name: string, fallback: T): T {
-  const raw = readOutput(runId, name);
-  if (raw === null) return fallback;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
 }
 
 /** What a chat is called until the first turn names it. */
@@ -142,6 +138,12 @@ export function createApi(opts: {
   contextLoginSteps?: (runId: string) => Step[] | null;
   /** Injectable so the integration tests never reach Composio. */
   trackers?: TrackerClient;
+  /** Injectable so the payment tests never reach Pine Labs. Null means payments are not configured. */
+  payments?: { client: PineLabsClient; webhookSecret?: string } | null;
+  /** Overrides QA_PILOT_AGENT_TOKEN, so the MCP tests do not depend on the environment. */
+  agentToken?: string;
+  /** Injectable so the review tests do not launch a browser or call the planner. */
+  addReviewFlow?: typeof addReviewFlow;
 }) {
   const app = new Hono<AuthEnv>();
   const { store } = opts;
@@ -172,8 +174,73 @@ export function createApi(opts: {
   // guards itself inside the route group.
   app.route("/auth", authRoutes(store));
 
+  /**
+   * Pine Labs' signed webhook. Unauthenticated by session; the signature is the
+   * authentication, and a delivery that fails it is refused. Acknowledged fast, since Pine
+   * Labs retries anything slower than five seconds, and idempotent, since it retries anyway.
+   */
+  app.post("/webhooks/pinelabs", async (c) => {
+    const pay = payments();
+    if (!pay?.webhookSecret) return c.json({ error: "payments are not configured on this server" }, 503);
+    const raw = await c.req.text();
+    const h = (name: string) => c.req.header(name) ?? c.req.header(name.replace(/-/g, "_")) ?? null;
+    if (!verifyWebhook({ id: h("webhook-id"), timestamp: h("webhook-timestamp"), signature: h("webhook-signature") }, raw, pay.webhookSecret)) {
+      return c.json({ error: "bad signature" }, 401);
+    }
+    const event = parseWebhook(raw);
+    if (!event) return c.json({ error: "unreadable body" }, 400);
+    const rec = (event.merchantRef && (await store.getPayment(event.merchantRef))) || (event.orderId && (await store.findPaymentByOrder(event.orderId))) || null;
+    if (!rec) return c.json({ ok: true, ignored: "unknown order" });
+    if (event.orderId && !rec.orderId) await store.updatePayment(rec.id, { orderId: event.orderId });
+    if (event.type === "ORDER_PROCESSED" || event.status === "PROCESSED") await settle(rec.id);
+    else if (["PAYMENT_FAILED", "ORDER_FAILED", "ORDER_CANCELLED"].includes(event.type) && rec.status === "created") await store.updatePayment(rec.id, { status: "failed" });
+    return c.json({ ok: true });
+  });
+
+  /**
+   * Where Pine Labs sends the browser after checkout. Not behind the session: the return is a
+   * cross-site navigation that may not carry the cookie. It never trusts the browser's word -
+   * it asks Pine Labs for the order's status - so it is safe for anyone holding the reference.
+   */
+  app.all("/checkout/return", async (c) => {
+    const ref = c.req.query("ref") ?? "";
+    const rec = await store.getPayment(ref);
+    const pay = payments();
+    let status = rec?.status ?? "failed";
+    if (rec && pay && rec.status === "created" && rec.orderId) {
+      try {
+        const order = await pay.client.getOrder(rec.orderId);
+        if (order.status === "PROCESSED") status = (await settle(rec.id), "paid");
+        else if (["FAILED", "CANCELLED"].includes(order.status)) {
+          await store.updatePayment(rec.id, { status: "failed" });
+          status = "failed";
+        }
+      } catch (err) {
+        // The webhook will still settle it; the form polls /payments/:ref meanwhile.
+        console.error("[checkout] order lookup failed:", err);
+      }
+    }
+    const shown = status === "created" ? "pending" : status;
+    return c.redirect(`${UI_ORIGIN}/runs/new?payment=${shown}&ref=${encodeURIComponent(ref)}`, 303);
+  });
+
+  /**
+   * The defect-triage agent's tools as a remote MCP server. Not behind a user session: the
+   * agent authenticates with its own bearer token (QA_PILOT_AGENT_TOKEN), and with no token
+   * configured the endpoint is off rather than open.
+   */
+  app.all("/mcp", async (c) => {
+    const token = opts.agentToken ?? process.env.QA_PILOT_AGENT_TOKEN;
+    if (!token) return c.json({ error: "the triage agent endpoint is not configured" }, 503);
+    if (!agentAuthorized(c.req.header("authorization"), token)) return c.json({ error: "unauthorized" }, 401);
+    return handleMcp(c.req.raw, triageDeps);
+  });
+
   // Everything below requires a session.
   app.use("/run", requireUser(store));
+  app.use("/wallet", requireUser(store));
+  app.use("/checkout", requireUser(store));
+  app.use("/payments/*", requireUser(store));
   app.use("/runs", requireUser(store));
   app.use("/runs/*", requireUser(store));
   app.use("/events/*", requireUser(store));
@@ -189,6 +256,29 @@ export function createApi(opts: {
   // API has to come up for /health and /auth on a machine that has none configured.
   let llm = opts.llm;
   const getLlm = (): LlmClient => (llm ??= makeLlmClient());
+
+  // Resolved per call, like the trackers: the API must boot without Pine Labs keys.
+  const payments = (): { client: PineLabsClient; webhookSecret?: string } | null => {
+    if (opts.payments !== undefined) return opts.payments;
+    const cfg = pineLabsFromEnv();
+    return cfg ? { client: pineLabsClient(cfg), webhookSecret: cfg.webhookSecret } : null;
+  };
+
+  /** Moves a payment to paid and grants its credit; only the call that made the move grants it. */
+  async function settle(ref: string): Promise<void> {
+    const rec = await store.getPayment(ref);
+    if (rec && (await store.markPaymentPaid(ref))) await store.grantCredits(rec.userId, 1);
+  }
+
+  const triageDeps: TriageDeps = {
+    store,
+    trackers: () => trackers(),
+    uiOrigin: UI_ORIGIN,
+    submitVerdicts,
+    // A rerun signs in with the run's login steps, which only a run this process finished
+    // still holds; without them only the tests that never sign in can run.
+    rerun: async (runId, testIds) => (opts.rerunTests ?? runRerunTests)(runId, testIds, (opts.contextLoginSteps ?? liveLoginSteps)(runId) ?? [], store),
+  };
 
   /**
    * Resolves a run the caller is allowed to see, or null. A run owned by somebody else is
@@ -216,12 +306,61 @@ export function createApi(opts: {
     return chat && chat.kind === "copilot" ? chat : null;
   }
 
+  app.get("/wallet", async (c) => {
+    const wallet = await store.getWallet(c.get("user").id);
+    const tiers = Object.fromEntries(Object.entries(TIERS).map(([k, t]) => [k, { maxFlows: t.maxFlows, maxMinutes: t.budget.maxMinutes }]));
+    return c.json({ ...wallet, priceInr: TIERS.paid.priceInr, tiers });
+  });
+
+  /**
+   * Starts a Pine Labs checkout for one paid run. The browser is sent to the hosted checkout
+   * and comes back through /checkout/return; the credit is granted when Pine Labs confirms.
+   */
+  app.post("/checkout", async (c) => {
+    const pay = payments();
+    if (!pay) return c.json({ error: "payments are not configured on this server" }, 503);
+    const user = c.get("user");
+    const ref = `qp-${randomUUID()}`;
+    await store.insertPayment({ id: ref, userId: user.id, amountPaisa: PAID_RUN_PAISA, status: "created", createdAt: new Date().toISOString() });
+    const back = `${API_ORIGIN}/checkout/return?ref=${encodeURIComponent(ref)}`;
+    try {
+      const order = await pay.client.createCheckout({ merchantRef: ref, amountPaisa: PAID_RUN_PAISA, callbackUrl: back, failureUrl: `${back}&failed=1`, email: user.email, customerId: user.id });
+      if (order.orderId) await store.updatePayment(ref, { orderId: order.orderId });
+      return c.json({ ref, redirectUrl: order.redirectUrl });
+    } catch (err) {
+      await store.updatePayment(ref, { status: "failed" });
+      console.error("[checkout] could not create the order:", err);
+      return c.json({ error: "the payment page could not be opened; try again" }, 502);
+    }
+  });
+
+  /** Where a checkout stands, for the start form to poll after the browser comes back. */
+  app.get("/payments/:ref", async (c) => {
+    const rec = await store.getPayment(c.req.param("ref"));
+    if (!rec || rec.userId !== c.get("user").id) return c.json({ error: "not found" }, 404);
+    return c.json({ status: rec.status });
+  });
+
   app.post("/run", async (c) => {
     const parsed = BodySchema.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
     const { prd, chatId, ...rest } = parsed.data;
     const userId = c.get("user").id;
-    const { runId } = await opts.start({ ...rest, runId: newRunId(), prdText: prd, userId });
+    const tier = await store.claimRunSlot(userId);
+    if (!tier) return c.json({ error: "your free run is used; pay for a run to start another", priceInr: TIERS.paid.priceInr }, 402);
+    const limits = TIERS[tier];
+    let runId: string;
+    try {
+      ({ runId } = await opts.start({
+        ...rest, runId: newRunId(), prdText: prd, userId, tier,
+        maxFlows: limits.maxFlows, budget: limits.budget, reviewPlan: true, autoHeal: false,
+      }));
+    } catch (err) {
+      // Nothing ran, so nothing was spent.
+      await store.refundSlot(userId, tier);
+      console.error("[run] could not start:", err);
+      return c.json({ error: "the run could not be started" }, 500);
+    }
     // Best-effort link, never a reason to fail the start: the run is already going by now,
     // and an unknown or foreign chatId only means history will not cross-reference it.
     if (chatId && (await ownedChat(chatId, userId))) await store.appendChatTurn(chatId, [], { runId });
@@ -610,59 +749,14 @@ export function createApi(opts: {
    * whatever it is asked to for a test in the plan, so the cases page can reuse it.
    */
   app.post("/runs/:runId/tests/:testId/ticket", async (c) => {
-    const userId = c.get("user").id;
-    const run = await ownedRun(c.req.param("runId"), userId);
+    const run = await ownedRun(c.req.param("runId"), c.get("user").id);
     if (!run) return c.json({ error: "not found" }, 404);
-    const testId = c.req.param("testId");
-    const catalogue = buildCatalogue(run);
-    const entry = catalogue.tests.find((t) => t.id === testId);
-    const flow = readJsonOutput<Flow[]>(run.id, "plan.json", []).find((f) => f.id === testId);
-    if (!entry || !flow) return c.json({ error: "not found" }, 404);
-
-    const integration = await store.getIntegration(userId);
-    if (!integration || integration.status !== "active" || !integration.destination) {
-      return c.json({ error: "connect Linear or Jira in Settings, and pick where issues go, to file a ticket", needs: ["integration"] }, 412);
-    }
-
-    const existing = await store.findTicket(userId, run.id, testId);
-    if (existing) return c.json({ ticket: existing });
-
-    const slot = `${userId}/${run.id}/${testId}`;
-    if (filing.has(slot)) return c.json({ error: "this ticket is already being filed" }, 409);
-    filing.add(slot);
-    try {
-      const client = trackerOr500(c);
-      if (client instanceof Response) return client;
-      const defect = readJsonOutput<Defect[]>(run.id, "defects.json", []).find((d) => d.flow === testId);
-      const latest = readJsonOutput<RunResults>(run.id, "results.json", { tests: [], at: "" });
-      const latestResult = (Array.isArray(latest.tests) ? latest.tests : []).find((t) => t.id === testId);
-      const body = buildTicket({
-        runId: run.id, url: run.url, testId, flow, defect,
-        verdict: entry.verdict ? { class: entry.verdict.class, confidence: entry.verdict.confidence } : undefined,
-        latest: latestResult ? { error: latestResult.error, at: latest.at } : undefined,
-        uiOrigin: UI_ORIGIN,
-      });
-      let created: { key: string; url: string };
-      try {
-        created = await client.createIssue(userId, integration.provider, integration.connectedAccountId, integration.destination, body);
-      } catch (err) {
-        if (err instanceof TrackerError) return c.json({ error: err.message }, 502);
-        console.error("[tickets] create failed:", err);
-        return c.json({ error: `could not reach ${integration.provider} through Composio; try again` }, 502);
-      }
-      const ticket = { id: randomUUID(), userId, runId: run.id, testId, provider: integration.provider, key: created.key, url: created.url, createdAt: new Date().toISOString() };
-      try {
-        await store.insertTicket(ticket);
-      } catch (err) {
-        // Two requests raced past the pre-check; the index kept one. Answer with the survivor.
-        const survivor = await store.findTicket(userId, run.id, testId);
-        if (survivor) return c.json({ ticket: survivor });
-        throw err;
-      }
-      return c.json({ ticket });
-    } finally {
-      filing.delete(slot);
-    }
+    const out = await fileTicket({
+      store, trackers, run, testId: c.req.param("testId"), by: "owner", uiOrigin: UI_ORIGIN,
+      confirm: (defectId) => { submitVerdicts(run.id, [{ defectId, verdict: "confirmed", note: "confirmed by filing a ticket" }], "owner"); },
+    });
+    if (!out.ok) return c.json({ error: out.error, ...(out.needs ? { needs: out.needs } : {}) }, out.status);
+    return c.json({ ticket: out.ticket });
   });
 
   app.get("/runs/:runId", async (c) => {
@@ -682,8 +776,62 @@ export function createApi(opts: {
     const parsed = ReviewSubmissionSchema.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
     if (!awaitingReview(runId)) return c.json({ error: "this run is not waiting for review" }, 409);
+    // Flows added in plain words can take the checklist past what the run was paid for; the
+    // reviewer chooses which to drop rather than the server choosing for them.
+    const cap = reviewFlowCap(runId);
+    if (cap !== null && parsed.data.flows.length > cap) {
+      return c.json({ error: `this run can generate up to ${cap} flows; untick ${parsed.data.flows.length - cap} to continue` }, 400);
+    }
     submitReview(runId, parsed.data.flows);
     return c.json({ ok: true, flows: parsed.data.flows.length });
+  });
+
+  /**
+   * A flow the reviewer described in plain words at the approval checklist. It is planned and
+   * walked live against the run's site map and handed back for the checklist; it joins the
+   * plan only if the reviewer keeps it in the list they submit.
+   */
+  app.post("/runs/:runId/review/flows", async (c) => {
+    const runId = c.req.param("runId");
+    if (!(await ownedRun(runId, c.get("user").id))) return c.json({ error: "not found" }, 404);
+    const parsed = AddFlowSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+    const out = await (opts.addReviewFlow ?? addReviewFlow)(runId, parsed.data.text);
+    if (!out) return c.json({ error: "this run is not waiting for review" }, 409);
+    if (!out.flow) return c.json({ error: out.reason ?? "the flow could not be planned" }, 422);
+    return c.json({ flow: out.flow });
+  });
+
+  /** Everything the triage agent did on this run, oldest first. */
+  app.get("/runs/:runId/triage-log", async (c) => {
+    const runId = c.req.param("runId");
+    if (!(await ownedRun(runId, c.get("user").id))) return c.json({ error: "not found" }, 404);
+    return c.json({ entries: readTriageLog(runId) });
+  });
+
+  /** The run's candidate defects and the rulings on them so far. */
+  app.get("/runs/:runId/defects", async (c) => {
+    const runId = c.req.param("runId");
+    if (!(await ownedRun(runId, c.get("user").id))) return c.json({ error: "not found" }, 404);
+    return c.json({ defects: readDefects(runId), verdicts: readVerdicts(runId), awaiting: awaitingConfirmation(runId) });
+  });
+
+  /**
+   * The owner's rulings on candidate defects: confirmed, rejected, or a script bug. Nothing is
+   * ever filed for a defect without a `confirmed` ruling. When the run is waiting and this
+   * leaves nothing undecided, the run resumes into its report.
+   */
+  app.post("/runs/:runId/defects", async (c) => {
+    const runId = c.req.param("runId");
+    if (!(await ownedRun(runId, c.get("user").id))) return c.json({ error: "not found" }, 404);
+    const parsed = VerdictSubmissionSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+    try {
+      return c.json(submitVerdicts(runId, parsed.data.verdicts, "owner"));
+    } catch (err) {
+      if (err instanceof UnknownDefectError) return c.json({ error: err.message }, 404);
+      throw err;
+    }
   });
 
   /** Re-executes one generated test of a finished run and returns its fresh result. */
@@ -692,7 +840,7 @@ export function createApi(opts: {
     const testId = c.req.param("testId");
     const run = await ownedRun(runId, c.get("user").id);
     if (!run || !isValidRunId(testId)) return c.json({ error: "not found" }, 404);
-    if (run.status === "running" || run.status === "awaiting_review") return c.json({ error: "the run is still in progress" }, 409);
+    if (run.status === "running" || run.status === "awaiting_review" || run.status === "awaiting_confirmation") return c.json({ error: "the run is still in progress" }, 409);
     const blocker = await (opts.rerunBlocker ?? rerunBlocker)(runId, testId, store);
     if (blocker === "test not found") return c.json({ error: blocker }, 404);
     if (blocker) return c.json({ error: blocker }, 409);
@@ -869,7 +1017,7 @@ if (process.argv[1] && process.argv[1].endsWith("api.ts")) {
   const app = createApi({
     store,
     start: async (input) => {
-      const { runId, done } = await startRun(input);
+      const { runId, done } = await startRun(input, { store, onCandidates: triageHandoff(store, UI_ORIGIN) });
       done.catch(() => {});
       return { runId };
     },

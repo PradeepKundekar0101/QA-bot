@@ -1,23 +1,109 @@
 "use client";
-import { useEffect, useReducer, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useReducer, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { PageHeader } from "@/components/shell/PageHeader";
 import { Button, Card, CardRow, Checkbox, Field, Flash, Icon, Input, Segmented, Spinner, Textarea, Wallpaper } from "@/components/ui";
+import { RunTierCard } from "@/components/billing/RunTierCard";
 import { ChatPanel } from "@/components/chat/ChatPanel";
-import { startRun } from "@/lib/api";
-import { DEFAULT_DRAFT, formReducer, isValidUrl, runInputFromDraft, type DraftField, type RunDraft } from "@/lib/draft";
+import { ApiError, getPayment, getWallet, startCheckout, startRun, type Wallet } from "@/lib/api";
+import { DEFAULT_DRAFT, formReducer, isValidUrl, runInputFromDraft, snapshotOf, type DraftField, type DraftPatch, type RunDraft } from "@/lib/draft";
 
 /** How long a field the assistant wrote stays ringed. Long enough to catch, short enough to ignore. */
 const FLASH_MS = 1600;
+
+/**
+ * Where the form waits while the browser is away at the Pine Labs checkout. The snapshot
+ * never holds the target app's credentials, so they are typed again after paying.
+ */
+const STASH_KEY = "qa-pilot:new-run-draft";
+/** How long to wait for Pine Labs to confirm a payment the browser came back from. */
+const PAYMENT_POLL_MS = 2000;
+const PAYMENT_POLL_TRIES = 30;
+
+type PaymentNotice = { tone: "info" | "pass" | "fail"; text: string };
+
+function stash(draft: RunDraft): void {
+  try {
+    sessionStorage.setItem(STASH_KEY, JSON.stringify(snapshotOf(draft)));
+  } catch {
+    // Storage blocked: the person retypes the URL after paying, nothing worse.
+  }
+}
+
+function takeStash(): DraftPatch | null {
+  try {
+    const raw = sessionStorage.getItem(STASH_KEY);
+    sessionStorage.removeItem(STASH_KEY);
+    return raw ? (JSON.parse(raw) as DraftPatch) : null;
+  } catch {
+    return null;
+  }
+}
 
 export default function NewRunPage() {
   const router = useRouter();
   const [{ draft, flash }, dispatch] = useReducer(formReducer, { draft: DEFAULT_DRAFT, flash: [] });
   const [chatId, setChatId] = useState<string | null>(null);
   const [prdMode, setPrdMode] = useState<"upload" | "paste">("upload");
-  const [advanced, setAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [payment, setPayment] = useState<PaymentNotice | null>(null);
+  const params = useSearchParams();
+  const canRun = wallet !== null && (!wallet.freeRunUsed || wallet.paidCredits > 0);
+
+  const loadWallet = useCallback(() => {
+    getWallet().then((w) => { setWallet(w); setWalletError(null); }).catch((err) => setWalletError((err as Error).message));
+  }, []);
+  useEffect(() => { loadWallet(); }, [loadWallet]);
+
+  // Coming back from the checkout: restore the form, then wait for Pine Labs to confirm. The
+  // return URL only says what the browser saw; the wallet is what decides.
+  const returned = params.get("payment");
+  const ref = params.get("ref");
+  useEffect(() => {
+    if (!returned) return;
+    let cancelled = false;
+    (async () => {
+      const saved = takeStash();
+      if (saved) dispatch({ kind: "load", patch: saved });
+      router.replace("/runs/new", { scroll: false });
+      if (returned === "failed" || !ref) {
+        setPayment({ tone: "fail", text: "The payment did not go through. Nothing was charged; try again." });
+        return;
+      }
+      setPayment({ tone: "info", text: "Waiting for Pine Labs to confirm the payment." });
+      for (let i = 0; i < PAYMENT_POLL_TRIES && !cancelled; i++) {
+        const status = await getPayment(ref).catch(() => "created" as const);
+        if (status === "paid") {
+          setPayment({ tone: "pass", text: "Payment received. Your paid run is ready to start." });
+          loadWallet();
+          return;
+        }
+        if (status === "failed") {
+          setPayment({ tone: "fail", text: "The payment did not go through. Try again." });
+          return;
+        }
+        await new Promise((r) => setTimeout(r, PAYMENT_POLL_MS));
+      }
+      if (!cancelled) setPayment({ tone: "info", text: "Pine Labs has not confirmed the payment yet. Your run will be available here as soon as it does." });
+    })();
+    return () => { cancelled = true; };
+  }, [returned, ref, router, loadWallet]);
+
+  async function pay() {
+    setError(null);
+    setBusy(true);
+    try {
+      const { redirectUrl } = await startCheckout();
+      stash(draft);
+      window.location.assign(redirectUrl);
+    } catch (err) {
+      setError((err as Error).message);
+      setBusy(false);
+    }
+  }
 
   const lit = (field: DraftField) => flash.includes(field);
   const edit = (fields: Partial<RunDraft>) => dispatch({ kind: "edit", fields });
@@ -48,6 +134,8 @@ export default function NewRunPage() {
       // actually running - rather than on a Test Runs screen with an empty table.
       router.push(`/runs/${encodeURIComponent(runId)}/sources`);
     } catch (err) {
+      // Another tab may have spent the last run since the wallet was read.
+      if (err instanceof ApiError && err.status === 402) loadWallet();
       setError((err as Error).message);
       setBusy(false);
     }
@@ -60,7 +148,7 @@ export default function NewRunPage() {
         <PageHeader
           crumbs={[{ label: "Runs", href: "/" }, { label: "New run" }]}
           title="Start a run"
-          subtitle="Tell AEGIS what to test, in the form or in the chat. It explores the app, writes a plan, scores the plan for gaps, generates Playwright tests, runs them, and repairs what breaks."
+          subtitle="Tell AEGIS what to test, in the form or in the chat. It explores the app and writes a plan for you to approve, then generates Playwright tests, runs them, and asks you to confirm each defect it finds."
         />
 
         <div className="mx-auto w-full max-w-[960px] flex-1 space-y-4 px-6 pb-32 pt-5">
@@ -143,64 +231,19 @@ export default function NewRunPage() {
             </CardRow>
           </Card>
 
-          <Card title="Review">
-            <CardRow>
-              <div className="py-4">
-                <Flash on={lit("reviewPlan")} className="-m-1 p-1">
-                  <Checkbox
-                    checked={draft.reviewPlan} onChange={(v) => edit({ reviewPlan: v })} label="Review the plan before tests are generated?"
-                    help="Pauses the run once the plan has passed the coverage gate so you can rename, re-prioritise or drop proposed tests. Leave it off for a fully autonomous run."
-                  />
-                </Flash>
-              </div>
-            </CardRow>
-          </Card>
-
-          <Card
-            title="Budget"
-            actions={
-              <Button type="button" variant="ghost" size="sm" onClick={() => setAdvanced((v) => !v)} aria-expanded={advanced}>
-                {advanced ? "Hide" : "Show"} advanced
-              </Button>
-            }
-          >
-            {advanced ? (
-              <>
-                <CardRow>
-                  <Field label="Max flows" help="Upper bound on how many flows the planner may produce.">
-                    <Flash on={lit("maxFlows")}>
-                      <Input type="number" min={1} value={draft.maxFlows} onChange={(e) => edit({ maxFlows: Number(e.target.value) })} />
-                    </Flash>
-                  </Field>
-                </CardRow>
-                <CardRow>
-                  <Field label="Max LLM calls" help="The run stops and reports partially once this is exceeded.">
-                    <Flash on={lit("budget")}>
-                      <Input type="number" min={1} value={draft.budget.maxLlmCalls} onChange={(e) => edit({ budget: { ...draft.budget, maxLlmCalls: Number(e.target.value) } })} />
-                    </Flash>
-                  </Field>
-                </CardRow>
-                <CardRow>
-                  <Field label="Max minutes" help="Wall-clock budget for the whole run.">
-                    <Flash on={lit("budget")}>
-                      <Input type="number" min={1} value={draft.budget.maxMinutes} onChange={(e) => edit({ budget: { ...draft.budget, maxMinutes: Number(e.target.value) } })} />
-                    </Flash>
-                  </Field>
-                </CardRow>
-              </>
-            ) : (
-              <p className="py-4 text-[13px] text-muted">
-                <span className={`font-mono ${lit("maxFlows") ? "text-info" : "text-fg"}`}>{draft.maxFlows}</span> flows,{" "}
-                <span className={`font-mono ${lit("budget") ? "text-info" : "text-fg"}`}>{draft.budget.maxLlmCalls}</span> LLM calls,{" "}
-                <span className={`font-mono ${lit("budget") ? "text-info" : "text-fg"}`}>{draft.budget.maxMinutes}</span> minutes.
-              </p>
-            )}
-          </Card>
+          <RunTierCard wallet={wallet} error={walletError} />
         </div>
 
         {/* Sticky action bar. The primary stays disabled until the URL parses, so the bar is
             also the validity readout - and the one place a run can be started from. */}
         <div className="sticky bottom-0 z-20 border-t border-line bg-surface/90 px-6 py-3.5 backdrop-blur-md">
+          {payment && (
+            <p role="status" className={`mx-auto mb-3 flex max-w-[960px] items-center gap-2 rounded-input border px-3 py-2 text-[13px] ${
+              payment.tone === "pass" ? "border-pass/25 bg-pass/10 text-pass" : payment.tone === "fail" ? "border-fail/25 bg-fail/10 text-fail" : "border-info/25 bg-info/10 text-info"
+            }`}>
+              {payment.tone === "info" ? <Spinner /> : <Icon name={payment.tone === "pass" ? "check" : "alert"} size={14} />} {payment.text}
+            </p>
+          )}
           {error && (
             <p role="alert" className="mx-auto mb-3 flex max-w-[960px] items-center gap-2 rounded-input border border-fail/25 bg-fail/10 px-3 py-2 text-[13px] text-fail">
               <Icon name="alert" size={14} /> {error}
@@ -208,13 +251,21 @@ export default function NewRunPage() {
           )}
           <div className="mx-auto flex max-w-[960px] items-center justify-between gap-3">
             <p className="hidden text-[12.5px] text-muted sm:block">
-              {isValidUrl(draft.url) ? "Ready. AEGIS will explore, plan, generate and run." : "Enter a valid http(s) URL to continue."}
+              {!isValidUrl(draft.url) ? "Enter a valid http(s) URL to continue."
+                : wallet && !canRun ? "Pay for a run to start it. You come back here afterwards."
+                : "Ready. AEGIS will explore, then wait for you to approve the plan."}
             </p>
             <div className="flex flex-1 justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => router.push("/")}>Cancel</Button>
-              <Button type="submit" disabled={busy || !isValidUrl(draft.url)}>
-                {busy ? <><Spinner /> starting</> : "Start run"}
-              </Button>
+              {wallet && !canRun ? (
+                <Button type="button" onClick={pay} disabled={busy || !isValidUrl(draft.url)}>
+                  {busy ? <><Spinner /> Opening checkout</> : <>Pay ₹{wallet.priceInr}</>}
+                </Button>
+              ) : (
+                <Button type="submit" disabled={busy || !canRun || !isValidUrl(draft.url)}>
+                  {busy ? <><Spinner /> starting</> : "Start run"}
+                </Button>
+              )}
             </div>
           </div>
         </div>

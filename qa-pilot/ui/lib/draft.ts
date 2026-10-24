@@ -14,26 +14,11 @@ export type RunDraft = {
   /** Target-app credentials. Held here for the length of the visit and sent only with the run. */
   username: string;
   password: string;
-  reviewPlan: boolean;
-  maxFlows: number;
-  budget: { maxLlmCalls: number; maxMinutes: number };
 };
-
-/**
- * How many flows a new run plans by default. Mirrors the orchestrator's own default
- * (`DEFAULT_MAX_FLOWS` in `state.ts`), which is what a run actually uses when the form
- * does not send one; the two are kept in step by hand because the UI and the orchestrator
- * share no package.
- *
- * Three, not a dozen: the plan is written in one LLM call whose length scales with the
- * number of flows, and it is the longest wait in a run.
- */
-export const DEFAULT_MAX_FLOWS = 3;
 
 export const DEFAULT_DRAFT: RunDraft = {
   url: "", intent: "", prdText: "", prdName: "",
   requiresSignIn: false, username: "", password: "",
-  reviewPlan: false, maxFlows: DEFAULT_MAX_FLOWS, budget: { maxLlmCalls: 200, maxMinutes: 40 },
 };
 
 /** The fields a chat turn may write. Mirrors the server's patch shape. */
@@ -43,13 +28,10 @@ export type DraftPatch = {
   prdText?: string;
   prdName?: string;
   requiresSignIn?: boolean;
-  reviewPlan?: boolean;
-  maxFlows?: number;
-  budget?: { maxLlmCalls?: number; maxMinutes?: number };
 };
 
 /** Names used both for the flash highlight and for the "filled in X" line under a reply. */
-export type DraftField = "url" | "intent" | "prd" | "requiresSignIn" | "reviewPlan" | "maxFlows" | "budget";
+export type DraftField = "url" | "intent" | "prd" | "requiresSignIn";
 
 export function isValidUrl(value: string): boolean {
   try {
@@ -77,11 +59,6 @@ export function applyPatch(draft: RunDraft, patch: DraftPatch): RunDraft {
     ...(patch.prdText !== undefined ? { prdText: patch.prdText } : {}),
     ...(patch.prdName !== undefined ? { prdName: patch.prdName } : {}),
     ...(patch.requiresSignIn !== undefined ? { requiresSignIn: patch.requiresSignIn } : {}),
-    ...(patch.reviewPlan !== undefined ? { reviewPlan: patch.reviewPlan } : {}),
-    ...(patch.maxFlows !== undefined ? { maxFlows: patch.maxFlows } : {}),
-    // Merged rather than replaced: a turn that changes the time budget should not silently
-    // reset the call budget to whatever the model happened to omit.
-    ...(patch.budget ? { budget: { ...draft.budget, ...patch.budget } } : {}),
   };
   return withCredentialRule(next);
 }
@@ -93,9 +70,6 @@ export function changedFields(before: RunDraft, after: RunDraft): DraftField[] {
   if (before.intent !== after.intent) changed.push("intent");
   if (before.prdText !== after.prdText || before.prdName !== after.prdName) changed.push("prd");
   if (before.requiresSignIn !== after.requiresSignIn) changed.push("requiresSignIn");
-  if (before.reviewPlan !== after.reviewPlan) changed.push("reviewPlan");
-  if (before.maxFlows !== after.maxFlows) changed.push("maxFlows");
-  if (before.budget.maxLlmCalls !== after.budget.maxLlmCalls || before.budget.maxMinutes !== after.budget.maxMinutes) changed.push("budget");
   return changed;
 }
 
@@ -105,12 +79,7 @@ export function changedFields(before: RunDraft, after: RunDraft): DraftField[] {
  * stored transcript - the sign-in flag goes, the account does not.
  */
 export function snapshotOf(draft: RunDraft): Record<string, unknown> {
-  const snapshot: Record<string, unknown> = {
-    requiresSignIn: draft.requiresSignIn,
-    reviewPlan: draft.reviewPlan,
-    maxFlows: draft.maxFlows,
-    budget: draft.budget,
-  };
+  const snapshot: Record<string, unknown> = { requiresSignIn: draft.requiresSignIn };
   if (draft.url.trim()) snapshot.url = draft.url.trim();
   if (draft.intent.trim()) snapshot.intent = draft.intent.trim();
   if (draft.prdText) snapshot.prdText = draft.prdText;
@@ -118,14 +87,12 @@ export function snapshotOf(draft: RunDraft): Record<string, unknown> {
   return snapshot;
 }
 
-/** The body of `POST /run`. Blank optional fields are omitted rather than sent as "". */
+/**
+ * The body of `POST /run`. Blank optional fields are omitted rather than sent as "". The flow
+ * cap, budget and plan review are not here: the server sets them from the account's tier.
+ */
 export function runInputFromDraft(draft: RunDraft, chatId?: string): NewRunInput {
-  const input: NewRunInput = {
-    url: draft.url.trim(),
-    maxFlows: draft.maxFlows,
-    budget: draft.budget,
-    reviewPlan: draft.reviewPlan,
-  };
+  const input: NewRunInput = { url: draft.url.trim() };
   const intent = draft.intent.trim();
   if (intent) input.intent = intent;
   const prd = draft.prdText.trim();

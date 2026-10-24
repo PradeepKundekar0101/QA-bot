@@ -92,10 +92,10 @@ describe("chat routes", () => {
     const id = await newChat(app);
     await app.request(`${ORIGIN}/chats/${id}/messages`, {
       method: "POST", headers,
-      body: JSON.stringify({ text: "go", snapshot: { intent: "typed by hand", reviewPlan: true } }),
+      body: JSON.stringify({ text: "go", snapshot: { intent: "typed by hand", requiresSignIn: true } }),
     });
     expect((await store.getChat(id))!.draft).toEqual({
-      url: "https://localhost:3005", intent: "typed by hand", reviewPlan: true,
+      url: "https://localhost:3005", intent: "typed by hand", requiresSignIn: true,
     });
   });
 

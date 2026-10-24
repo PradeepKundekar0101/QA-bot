@@ -157,8 +157,33 @@ export const DefectSchema = z.object({
   actual: z.string(),
   evidence: z.array(z.string()),
   attachments: z.array(z.string()),
+  /** The classifier's confidence that this is an application defect. */
+  confidence: z.number().min(0).max(1).optional(),
+  /** Below DEFECT_LOOK_THRESHOLD: shown to the person as "needs a look" and never filed without their confirmation. */
+  needsLook: z.boolean().optional(),
+  /** The classifier's one-sentence reasoning, shown next to the evidence. */
+  rationale: z.string().optional(),
+  /** The page where the test failed, as the classifier replayed it. */
+  screenshot: z.string().optional(),
 });
 export type Defect = z.infer<typeof DefectSchema>;
+
+/** A candidate defect under this confidence is labelled "needs a look". */
+export const DEFECT_LOOK_THRESHOLD = 0.6;
+
+/**
+ * A person's ruling on one candidate defect. Only a `confirmed` defect is ever filed; a
+ * `script` verdict says the test, not the app, is wrong.
+ */
+export const DefectVerdictSchema = z.object({
+  defectId: z.string(),
+  verdict: z.enum(["confirmed", "rejected", "script"]),
+  note: z.string().max(2000).optional(),
+  /** Who ruled: the run's owner in the UI, or the triage agent relaying the owner's answer. */
+  by: z.enum(["owner", "agent"]),
+  at: z.string(),
+});
+export type DefectVerdict = z.infer<typeof DefectVerdictSchema>;
 
 export const HealRecordSchema = z.object({
   test: z.string(),
@@ -211,6 +236,9 @@ export const RunInputSchema = z.object({
   // When true the graph pauses after the coverage gate so the plan can be reviewed, edited
   // and trimmed before any test is generated. Off by default: the pipeline is autonomous.
   reviewPlan: z.boolean().default(false),
+  // Whether the healer may patch a test that failed for script reasons. On for the CLI, which
+  // the operator drives; off for web runs, where a fix is the user's decision to accept.
+  autoHeal: z.boolean().default(true),
 });
 export type RunInput = z.infer<typeof RunInputSchema>;
 
@@ -226,7 +254,10 @@ export const RunStateAnnotation = Annotation.Root({
   maxFlows: Annotation<number>(),
   budget: Annotation<z.infer<typeof BudgetSchema>>(),
   reviewPlan: Annotation<boolean>({ reducer: (_a, b) => b, default: () => false }),
+  autoHeal: Annotation<boolean>({ reducer: (_a, b) => b, default: () => true }),
   startedAt: Annotation<string>(),
+  /** Wall-clock time the run spent paused at approval gates, which the minutes budget does not count. */
+  pausedMs: Annotation<number>({ reducer: (_a, b) => b, default: () => 0 }),
   siteMap: Annotation<SiteMap | undefined>(),
   plan: Annotation<Flow[]>({ reducer: (_a, b) => b, default: () => [] }),
   coverage: Annotation<CoverageVerdict | undefined>(),
@@ -270,7 +301,9 @@ export function initialState(input: { runId: string; url: string } & Partial<Run
     maxFlows: parsed.maxFlows,
     budget: parsed.budget,
     reviewPlan: parsed.reviewPlan,
+    autoHeal: parsed.autoHeal,
     startedAt: new Date().toISOString(),
+    pausedMs: 0,
     siteMap: undefined,
     plan: [],
     coverage: undefined,
@@ -303,7 +336,11 @@ export function initialState(input: { runId: string; url: string } & Partial<Run
  * owns a run, and putting it in graph state would widen the checkpointed payload for
  * nothing.
  */
-export const StartRunInputSchema = RunInputSchema.extend({ userId: z.string().min(1) });
+export const StartRunInputSchema = RunInputSchema.extend({
+  userId: z.string().min(1),
+  /** What the run was paid with; recorded on the run so a failed start can be refunded in kind. Absent on CLI runs. */
+  tier: z.enum(["free", "paid"]).optional(),
+});
 /** The input side of the schema: fields with defaults (budget, maxFlows, reviewPlan) stay optional for callers. */
 export type StartRunInput = z.input<typeof StartRunInputSchema>;
 

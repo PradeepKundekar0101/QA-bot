@@ -15,4 +15,8 @@ describe("budgetExceeded", () => {
     const s = { ...initialState({ runId: "r", url: "http://x" }), startedAt: new Date(Date.now() - 41 * 60_000).toISOString() };
     expect(budgetExceeded(s)).toMatch(/minutes/);
   });
+  it("does not charge the time a person spent at an approval gate", () => {
+    const s = { ...initialState({ runId: "r", url: "http://x" }), startedAt: new Date(Date.now() - 41 * 60_000).toISOString(), pausedMs: 10 * 60_000 };
+    expect(budgetExceeded(s)).toBeNull();
+  });
 });

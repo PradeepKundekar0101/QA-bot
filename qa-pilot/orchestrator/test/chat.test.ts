@@ -25,19 +25,8 @@ describe("normalisePatch", () => {
     expect(normalisePatch({ intent: "checkout" }).intent).toBe("checkout");
   });
 
-  it("floors a fractional flow count and drops one below one", () => {
-    expect(normalisePatch({ maxFlows: 8.7 }).maxFlows).toBe(8);
-    expect(normalisePatch({ maxFlows: 0 })).not.toHaveProperty("maxFlows");
-    expect(normalisePatch({ maxFlows: -3 })).not.toHaveProperty("maxFlows");
-  });
-
-  it("keeps only the valid half of a budget", () => {
-    expect(normalisePatch({ budget: { maxLlmCalls: 300, maxMinutes: 0 } }).budget).toEqual({ maxLlmCalls: 300 });
-    expect(normalisePatch({ budget: { maxMinutes: 0, maxLlmCalls: 0 } })).not.toHaveProperty("budget");
-  });
-
-  it("keeps the booleans the form owns", () => {
-    expect(normalisePatch({ requiresSignIn: true, reviewPlan: true })).toEqual({ requiresSignIn: true, reviewPlan: true });
+  it("keeps the sign-in flag and drops the run limits, which the server sets from the account's tier", () => {
+    expect(normalisePatch({ requiresSignIn: true, reviewPlan: true, maxFlows: 8, budget: { maxMinutes: 60 } })).toEqual({ requiresSignIn: true });
   });
 
   it("drops anything outside the draft, credentials above all", () => {

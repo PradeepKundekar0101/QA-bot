@@ -98,6 +98,17 @@ describe("startRun recording", () => {
     expect(rec!.finishedAt).toBeTruthy();
   });
 
+  it("records the tier and returns the run to the wallet when it ends before a plan exists", async () => {
+    expect(await store.claimRunSlot("u1")).toBe("free");
+    const { done } = await startRun(
+      { runId: "rec-4", url: shop.base, userId: "u1", tier: "free", maxFlows: 6, budget: { maxLlmCalls: 60, maxMinutes: 5 } },
+      { headless: true, store, llm: new FakeLlmClient({}) },
+    );
+    expect(await store.getRun("rec-4")).toMatchObject({ tier: "free", maxLlmCalls: 60, maxFlows: 6 });
+    await done;
+    expect(await store.getWallet("u1")).toEqual({ freeRunUsed: false, paidCredits: 0 });
+  });
+
   it("advances the heartbeat as nodes finish", async () => {
     const { done } = await startRun(
       { runId: "rec-3", url: shop.base, userId: "u1", maxFlows: 12, budget: { maxLlmCalls: 200, maxMinutes: 40 } },

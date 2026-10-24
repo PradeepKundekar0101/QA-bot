@@ -1,4 +1,5 @@
-import type { RunState, RunUpdate, TestResult, HealRecord, Defect, Decision, Classification } from "../state.js";
+import type { RunState, RunUpdate, TestResult, HealRecord, Defect, DefectVerdict, Decision, Classification } from "../state.js";
+import { readVerdicts } from "../defects/verdicts.js";
 import { writeOutput } from "../output.js";
 import { writeSuite } from "../suite/bundle.js";
 import type { NodeDeps } from "./deps.js";
@@ -25,14 +26,23 @@ function fenceGuard(s: string): string {
 
 const row = (cells: (string | number)[]) => `| ${cells.map(cell).join(" | ")} |`;
 
-export function renderReport(state: RunState): string {
+/** How a candidate defect stands with the person who rules on it. Only a confirmed one is a bug report. */
+export function verdictLabel(d: Defect, verdicts: Map<string, DefectVerdict>): string {
+  const v = verdicts.get(d.id);
+  const ruling = !v ? "awaiting confirmation" : v.verdict === "confirmed" ? "confirmed" : v.verdict === "script" ? "ruled a script bug" : "rejected";
+  return d.needsLook && !v ? `${ruling} (needs a look: low confidence)` : ruling;
+}
+
+export function renderReport(state: RunState, verdictList: DefectVerdict[] = []): string {
+  const verdicts = new Map(verdictList.map((v) => [v.defectId, v]));
+  const confirmed = state.defects.filter((d) => verdicts.get(d.id)?.verdict === "confirmed").length;
   const tests = state.results?.tests ?? [];
   const passed = tests.filter((t) => t.status === "passed").length;
   const cls = new Map(state.classifications.map((c) => [c.test, c]));
   const md: string[] = [];
   md.push(`# AEGIS report for ${text(state.url)}`, "", `Run ${text(state.runId)}${state.partial ? ` (partial: ${text(state.partialReason ?? "unknown reason")})` : ""}.`, "");
-  md.push("## Summary", "", row(["Flows planned", "Tests generated", "Passed", "Failed", "Heals", "Defects", "Coverage", "LLM calls"]), row(["---", "---", "---", "---", "---", "---", "---", "---"]),
-    row([state.plan.length, tests.length, passed, tests.length - passed, state.healLog.filter((h) => h.accepted).length, state.defects.length, state.coverage?.score ?? "n/a", state.llmCalls]), "");
+  md.push("## Summary", "", row(["Flows planned", "Tests generated", "Passed", "Failed", "Heals", "Candidate defects", "Confirmed defects", "Coverage", "LLM calls"]), row(["---", "---", "---", "---", "---", "---", "---", "---", "---"]),
+    row([state.plan.length, tests.length, passed, tests.length - passed, state.healLog.filter((h) => h.accepted).length, state.defects.length, confirmed, state.coverage?.score ?? "n/a", state.llmCalls]), "");
   md.push("## Flows by category", "");
   const cats = new Map<string, number>();
   for (const f of state.plan) cats.set(f.category, (cats.get(f.category) ?? 0) + 1);
@@ -49,7 +59,7 @@ export function renderReport(state: RunState): string {
   md.push("## Defects", "");
   if (!state.defects.length) md.push("No defects escalated.");
   for (const d of state.defects) {
-    md.push(`### ${text(d.id)}: ${text(d.title)}`, "", `Severity: ${d.severity}. Flow: ${text(d.flow)}.`, "", "Repro steps:", "", ...d.repro_steps.map((s) => `- ${text(s)}`), "", `Expected: ${text(d.expected)}`, "", `Actual: ${text(d.actual)}`, "", "Evidence:", "", ...d.evidence.map((e) => `- ${text(e)}`), "");
+    md.push(`### ${text(d.id)}: ${text(d.title)}`, "", `Status: ${verdictLabel(d, verdicts)}. Severity: ${d.severity}. Flow: ${text(d.flow)}.${d.confidence !== undefined ? ` Confidence: ${d.confidence}.` : ""}`, "", "Repro steps:", "", ...d.repro_steps.map((s) => `- ${text(s)}`), "", `Expected: ${text(d.expected)}`, "", `Actual: ${text(d.actual)}`, "", "Evidence:", "", ...d.evidence.map((e) => `- ${text(e)}`), "");
     const c = cls.get(d.flow);
     if (c?.rationale) md.push(`Classifier rationale: ${text(c.rationale)}`, "");
     if (d.attachments.length) md.push(...d.attachments.map((a) => `- trace: ${text(a)}`), "");
@@ -213,13 +223,18 @@ function renderHeals(heals: HealRecord[]): string {
     )
     .join("");
 }
-function renderDefects(defects: Defect[], cls: Map<string, Classification>): string {
+function verdictPill(d: Defect, verdicts: Map<string, DefectVerdict>): string {
+  const v = verdicts.get(d.id)?.verdict;
+  const cls = v === "confirmed" ? "pill-defect" : v === "script" ? "pill-info" : v === "rejected" ? "pill-env" : "pill-human";
+  return `<span class="pill ${cls}">${text(verdictLabel(d, verdicts))}</span>`;
+}
+function renderDefects(defects: Defect[], cls: Map<string, Classification>, verdicts: Map<string, DefectVerdict>): string {
   if (!defects.length) return `<p class="empty">No defects escalated.</p>`;
   return defects
     .map((d) => {
       const c = cls.get(d.flow);
       return `<div class="card">
-<div class="card-title">${severityPill(d.severity)} ${text(d.id)}: ${text(d.title)}</div>
+<div class="card-title">${severityPill(d.severity)} ${verdictPill(d, verdicts)} ${text(d.id)}: ${text(d.title)}</div>
 <div class="card-meta">Flow: <code>${text(d.flow)}</code></div>
 <dl class="kv"><dt>Expected</dt><dd>${text(d.expected)}</dd><dt>Actual</dt><dd>${text(d.actual)}</dd></dl>
 ${d.repro_steps.length ? `<div class="card-meta" style="margin-top:.5rem">Repro steps</div><ul class="plain">${d.repro_steps.map((s) => `<li>${text(s)}</li>`).join("")}</ul>` : ""}
@@ -237,7 +252,9 @@ function renderTimeline(decisions: Decision[]): string {
     .join("")}</div>`;
 }
 
-function renderReportHtml(state: RunState): string {
+function renderReportHtml(state: RunState, verdictList: DefectVerdict[] = []): string {
+  const verdicts = new Map(verdictList.map((v) => [v.defectId, v]));
+  const confirmed = state.defects.filter((d) => verdicts.get(d.id)?.verdict === "confirmed").length;
   const tests = state.results?.tests ?? [];
   const passed = tests.filter((t) => t.status === "passed").length;
   const cls = new Map(state.classifications.map((c) => [c.test, c]));
@@ -271,7 +288,8 @@ ${statCard("Tests generated", tests.length)}
 ${statCard("Passed", passed)}
 ${statCard("Failed", tests.length - passed)}
 ${statCard("Heals accepted", heals)}
-${statCard("Defects", state.defects.length)}
+${statCard("Candidate defects", state.defects.length)}
+${statCard("Confirmed defects", confirmed)}
 <div class="stat-card"><div class="stat-value">${coveragePct === null ? "n/a" : coveragePct + "%"}</div><div class="stat-label">Coverage</div>${coveragePct !== null ? `<div class="meter"><div class="meter-fill" style="width:${coveragePct}%"></div></div>` : ""}</div>
 ${statCard("LLM calls", state.llmCalls)}
 </section>
@@ -285,7 +303,7 @@ ${state.unresolvedFlows.length ? `<span class="chip">dropped as unresolvable: ${
 
 <section><h2>Heals</h2>${renderHeals(state.healLog)}</section>
 
-<section><h2>Defects</h2>${renderDefects(state.defects, cls)}</section>
+<section><h2>Defects</h2>${renderDefects(state.defects, cls, verdicts)}</section>
 
 <section><h2>Coverage gaps remaining</h2>
 ${!state.coverage?.gaps.length ? `<p class="empty">None.</p>` : `<ul class="plain">${(state.coverage?.gaps ?? []).map((g) => `<li><code>${text(g.kind)}</code> ${text(g.target ?? g.requirement ?? "")}: ${text(g.suggest)}</li>`).join("")}</ul>`}
@@ -311,9 +329,10 @@ ${
 
 export async function reportNode(state: RunState, deps: NodeDeps): Promise<RunUpdate> {
   deps.bus.emit({ type: "node_start", node: "report" });
-  const md = renderReport(state);
+  const verdicts = readVerdicts(state.runId);
+  const md = renderReport(state, verdicts);
   writeOutput(state.runId, "report.md", md);
-  writeOutput(state.runId, "report.html", renderReportHtml(state));
+  writeOutput(state.runId, "report.html", renderReportHtml(state, verdicts));
   writeOutput(state.runId, "defects.json", state.defects);
   // What a later copilot rerun needs to sign in again, with the credential values redacted.
   writeRedactedLoginSteps(state.runId, state.siteMap?.loginSteps ?? [], state.credentials);
