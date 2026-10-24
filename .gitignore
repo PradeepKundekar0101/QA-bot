@@ -1,0 +1,6 @@
+node_modules
+.superpowers
+qa-pilot/node_modules
+qa-pilot/.superpowers
+qa-pilot/package-lock.json
+qa-pilot/node_modules
