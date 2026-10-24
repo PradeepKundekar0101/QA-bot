@@ -191,7 +191,11 @@ describe("screenshots never fail an agent", () => {
       const page = await shots.newPage();
       await page.goto(shop.base + "/login");
       expect(await shots.screenshot(page, "step one")).not.toBe("");
+      // Opens the throttle window as a step picture taken this instant would, rather than
+      // trusting the first capture to finish inside half a second on a loaded machine.
+      (shots as unknown as { lastShot: number }).lastShot = Date.now();
       expect(await shots.screenshot(page, "step two")).toBe("");
+      (shots as unknown as { lastShot: number }).lastShot = Date.now();
       expect(await shots.screenshot(page, "failure x", { evidence: true })).toMatch(/failure-x\.png$/);
     } finally {
       await shots.close();

@@ -102,6 +102,32 @@ describe("graph budget guard (fast, no browser)", () => {
   });
 });
 
+describe("defect confirmation relayed by the triage agent", () => {
+  it("finishes when the hand-off itself rules on every candidate before returning", async () => {
+    process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-graph-agent-")) + "/";
+    await fetch(shop.base + "/__chaos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ breakCoupon: true }) });
+    try {
+      const llm = new FakeLlmClient({
+        plan: { flows: flows.filter((f) => f.id === "checkout-001") },
+        "classify-rationale": { rationale: "Server returned 500 on the coupon endpoint.", confidence_adjustment: 0 },
+      });
+      const store = memoryStore();
+      // AgenticOrg runs the agent synchronously: the owner may answer, and the agent record
+      // the ruling, before the hand-off call has even returned.
+      const { done } = await startRun(
+        { runId: "agent-1", userId: "u-test", url: shop.base, credentials: { username: "demo@shop.test", password: "demo1234" }, maxFlows: 1, autoHeal: false },
+        { headless: true, llm, store, onCandidates: async (id, defects) => { submitVerdicts(id, defects.map((d) => ({ defectId: d.id, verdict: "confirmed" as const })), "agent"); } },
+      );
+      const final = await Promise.race([done, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("run stuck at confirmation")), 200_000))]);
+      expect(final.defects).toHaveLength(1);
+      expect((await store.getRun("agent-1"))!.status).toBe("done");
+      expect(readFileSync(outputDir("agent-1") + "report.md", "utf8")).toContain("Status: confirmed.");
+    } finally {
+      await fetch(shop.base + "/__chaos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ breakCoupon: false }) });
+    }
+  }, 300_000);
+});
+
 describe("plan review gate", () => {
   it("pauses after coverage, records awaiting_review, and generates only the flows the reviewer kept", async () => {
     process.env.QA_PILOT_OUTPUT = mkdtempSync(join(tmpdir(), "qa-graph-review-")) + "/";

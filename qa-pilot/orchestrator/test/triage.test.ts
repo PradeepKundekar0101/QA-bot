@@ -113,16 +113,16 @@ describe("triage agent MCP endpoint", () => {
 describe("starting the AgenticOrg triage agent", () => {
   const defects = [{ id: "DEF-1-checkout-001", title: "Coupon 500", severity: "critical" as const, flow: "checkout-001", repro_steps: [], expected: "", actual: "", evidence: ["POST /api/coupon returned 500"], attachments: [], confidence: 0.9, needsLook: false }];
 
-  it("posts the candidates and the owner's contact to the A2A tasks API and logs the task", async () => {
+  it("runs the custom agent with the candidates and the owner's contact, and logs the run", async () => {
     const sent: { url: string; init: RequestInit }[] = [];
-    const fakeFetch = (async (url: string, init: RequestInit) => { sent.push({ url, init }); return new Response(JSON.stringify({ id: "task-42" }), { status: 201 }); }) as unknown as typeof fetch;
-    const hook = triageHandoff(store, "https://app.qa-pilot.test", { baseUrl: "https://agenticorg.test", apiKey: "k-1", agentId: "qa-triage" }, fakeFetch);
+    const fakeFetch = (async (url: string, init: RequestInit) => { sent.push({ url, init }); return new Response(JSON.stringify({ run_id: "run_42", status: "completed" }), { status: 200 }); }) as unknown as typeof fetch;
+    const hook = triageHandoff(store, "https://app.qa-pilot.test", { baseUrl: "https://agenticorg.test", apiKey: "k-1", agentId: "agent-uuid-1" }, fakeFetch);
     await hook("tr-1", defects);
-    expect(sent[0].url).toBe("https://agenticorg.test/api/v1/a2a/tasks");
+    expect(sent[0].url).toBe("https://agenticorg.test/api/v1/agents/agent-uuid-1/run");
     expect((sent[0].init.headers as Record<string, string>).authorization).toBe("Bearer k-1");
     const body = JSON.parse(sent[0].init.body as string);
-    expect(body).toMatchObject({ agent_id: "qa-triage", input: { runId: "tr-1", ownerEmail: "owner@team.test", reviewUrl: "https://app.qa-pilot.test/runs/tr-1", candidates: [{ id: "DEF-1-checkout-001", needsLook: false }] } });
-    expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "ok", detail: { taskId: "task-42" } }]);
+    expect(body).toMatchObject({ action: "process", context: { runId: "tr-1" }, inputs: { runId: "tr-1", ownerEmail: "owner@team.test", reviewUrl: "https://app.qa-pilot.test/runs/tr-1", candidates: [{ id: "DEF-1-checkout-001", needsLook: false }] } });
+    expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "ok", detail: { taskId: "run_42", status: "completed" } }]);
   });
 
   it("logs that the owner decides in the app when AgenticOrg is not configured", async () => {

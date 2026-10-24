@@ -46,7 +46,7 @@ Rules to keep:
 ## Integrations
 
 - Payments: `billing/pinelabs.ts` (hosted checkout, Standard Webhooks signature check), routes `/checkout`, `/webhooks/pinelabs`, `/checkout/return`. A payment grants one credit exactly once.
-- Triage agent: qa-pilot serves its tools as a remote MCP server at `/mcp` (`triage/mcp.ts`, bearer `QA_PILOT_AGENT_TOKEN`) and starts the AgenticOrg agent through its A2A tasks API (`triage/agenticorg.ts`) when a run holds candidates.
+- Triage agent: qa-pilot serves its tools as a remote MCP server at `/mcp` (`triage/mcp.ts`, bearer `QA_PILOT_AGENT_TOKEN`) and runs the custom AgenticOrg agent through `POST /api/v1/agents/{id}/run` (`triage/agenticorg.ts`) when a run holds candidates. AgenticOrg's A2A endpoint only runs its built-in agent types. The run is synchronous on their side, so it is never awaited while a run is paused.
 - Trackers: Linear and Jira through Composio (`integrations/`).
 
-The Pine Labs response fields and AgenticOrg's auth header are not pinned down by their docs; both clients read them defensively and the AgenticOrg path and header are configurable.
+The Pine Labs response fields are not pinned down by their docs, so that client reads them defensively. AgenticOrg is source-available (github.com/mishrasanjeev/agentic-org); its source is the reference for request shapes and key scopes.

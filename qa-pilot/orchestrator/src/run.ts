@@ -97,6 +97,14 @@ export async function addReviewFlow(runId: string, text: string): Promise<{ flow
   return { flow: out.flow, ...(out.reason ? { reason: out.reason } : {}) };
 }
 
+/** Wakes a run parked at confirmation. */
+function releaseGate(runId: string): void {
+  const gate = gates.get(runId);
+  if (gate?.node !== CONFIRM_NODE) return;
+  gates.delete(runId);
+  gate.resume();
+}
+
 /**
  * Records rulings on candidate defects. When the run is paused at confirmation and nothing
  * is left undecided, the run resumes into its report. Rulings on a finished run are still
@@ -104,10 +112,8 @@ export async function addReviewFlow(runId: string, text: string): Promise<{ flow
  */
 export function submitVerdicts(runId: string, verdicts: VerdictSubmission["verdicts"], by: DefectVerdict["by"]): { verdicts: DefectVerdict[]; undecided: string[]; resumed: boolean } {
   const out = recordVerdicts(runId, verdicts, by);
-  const gate = gates.get(runId);
-  if (gate?.node === CONFIRM_NODE && out.undecided.length === 0) {
-    gates.delete(runId);
-    gate.resume();
+  if (gates.get(runId)?.node === CONFIRM_NODE && out.undecided.length === 0) {
+    releaseGate(runId);
     return { ...out, resumed: true };
   }
   return { ...out, resumed: false };
@@ -294,12 +300,16 @@ export async function startRun(
         if (undecided(s.defects, readVerdicts(parsed.runId)).length > 0) {
           bus.log("orchestrator", `${s.defects.length} candidate defect(s) waiting for confirmation`);
           await record(store, bus, parsed.runId, { status: "awaiting_confirmation" });
-          try {
-            await opts.onCandidates?.(parsed.runId, s.defects);
-          } catch (err) {
-            bus.log("orchestrator", `could not hand the candidates to the triage agent: ${(err as Error).message}`);
-          }
-          await new Promise<void>((resolve) => gates.set(parsed.runId, { node: CONFIRM_NODE, state: s, resume: resolve }));
+          // The gate is open before anyone is told about the candidates, so a ruling - from the
+          // owner, or from the agent while its run is still going - always has a run to resume.
+          const answered = new Promise<void>((resolve) => gates.set(parsed.runId, { node: CONFIRM_NODE, state: s, resume: resolve }));
+          // A ruling recorded between the check above and opening the gate found no gate to wake.
+          if (undecided(s.defects, readVerdicts(parsed.runId)).length === 0) releaseGate(parsed.runId);
+          // Not awaited: AgenticOrg runs the agent synchronously, and the run must not hang on it.
+          void opts.onCandidates?.(parsed.runId, s.defects).catch((err: Error) => {
+            bus.log("orchestrator", `could not hand the candidates to the triage agent: ${err.message}`);
+          });
+          await answered;
           await record(store, bus, parsed.runId, { status: "running" });
         }
         const verdicts = readVerdicts(parsed.runId);
