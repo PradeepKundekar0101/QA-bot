@@ -1,5 +1,9 @@
 "use client";
 
+/**
+ * The API's base URL: the API itself in local development, or "/api" when the UI is
+ * deployed in front of it and next.config.ts forwards that path (see QA_PILOT_API_UPSTREAM).
+ */
 export const API = process.env.NEXT_PUBLIC_QA_PILOT_API ?? "http://localhost:4000";
 
 export type PublicUser = { id: string; email: string; createdAt: string };

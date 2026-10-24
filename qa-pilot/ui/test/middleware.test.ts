@@ -75,4 +75,15 @@ describe("middleware matcher", () => {
   ])("skips the static asset %s", (path) => {
     expect(pattern.test(path)).toBe(false);
   });
+
+  // A deployed UI forwards /api to the API (next.config.ts). The API answers for itself -
+  // a 401 when there is no session - and signing up is how a session is obtained, so the
+  // login redirect must never intercept these.
+  it.each(["/api/auth/signup", "/api/health", "/api/events/run-1", "/api"])("skips the forwarded API path %s", (path) => {
+    expect(pattern.test(path)).toBe(false);
+  });
+
+  it("still runs on an app route that merely starts with the letters api", () => {
+    expect(pattern.test("/apiary")).toBe(true);
+  });
 });

@@ -46,5 +46,7 @@ export function middleware(req: NextRequest) {
  * screen and gets a 307 to /login.
  */
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png|wallpapers/).*)"],
+  // `api` is the deployed UI's forward to the API (see next.config.ts), which answers for
+  // itself; redirecting it to /login would break signing in.
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png|wallpapers/|api/|api$).*)"],
 };
