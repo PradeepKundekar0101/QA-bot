@@ -177,6 +177,30 @@ export type DefectVerdict = {
   at: string;
 };
 
+/** One thing the triage agent did on a run, from the run's triage log. */
+export type TriageLogEntry = { at: string; tool: string; input: unknown; outcome: "ok" | "refused" | "error"; detail?: unknown };
+
+export const getTriageLog = (runId: string) =>
+  apiFetch<{ entries: TriageLogEntry[] }>(`/runs/${encodeURIComponent(runId)}/triage-log`).then((r) => r.entries);
+
+/** What the AgenticOrg agent made of a run's candidates: its drafted message, or why there is none. */
+export type AgentHandoff =
+  | { state: "draft"; text: string }
+  | { state: "held" }
+  | { state: "failed"; reason: string }
+  | { state: "off" };
+
+/** Reads the newest hand-off from a triage log; null while the agent has not answered yet. */
+export function agentHandoff(entries: TriageLogEntry[]): AgentHandoff | null {
+  const last = [...entries].reverse().find((e) => e.tool === "start_triage_agent");
+  if (!last) return null;
+  if (last.outcome === "refused") return { state: "off" };
+  if (last.outcome === "error") return { state: "failed", reason: typeof last.detail === "string" ? last.detail : "the agent run failed" };
+  const d = (last.detail ?? {}) as { status?: string; draft?: string | null };
+  if (d.draft) return { state: "draft", text: d.draft };
+  return d.status === "hitl_triggered" ? { state: "held" } : { state: "failed", reason: "the agent returned no message" };
+}
+
 export const getDefects = (runId: string) =>
   apiFetch<{ defects: Defect[]; verdicts: DefectVerdict[]; awaiting: boolean }>(`/runs/${encodeURIComponent(runId)}/defects`);
 

@@ -118,14 +118,14 @@ describe("starting the AgenticOrg triage agent", () => {
 
   it("runs the custom agent with the candidates and the owner's contact, and logs the run", async () => {
     const sent: { url: string; init: RequestInit }[] = [];
-    const fakeFetch = (async (url: string, init: RequestInit) => { sent.push({ url, init }); return new Response(JSON.stringify({ run_id: "run_42", status: "completed" }), { status: 200 }); }) as unknown as typeof fetch;
+    const fakeFetch = (async (url: string, init: RequestInit) => { sent.push({ url, init }); return new Response(JSON.stringify({ run_id: "run_42", status: "completed", output: { status: "completed", raw_output: "Hi, qa-pilot found 1 likely bug: the coupon endpoint returned 500." } }), { status: 200 }); }) as unknown as typeof fetch;
     const hook = triageHandoff(store, "https://app.qa-pilot.test", { baseUrl: "https://agenticorg.test", apiKey: "k-1", agentId: "agent-uuid-1" }, fakeFetch);
     await hook("tr-1", defects);
     expect(sent[0].url).toBe("https://agenticorg.test/api/v1/agents/agent-uuid-1/run");
     expect((sent[0].init.headers as Record<string, string>).authorization).toBe("Bearer k-1");
     const body = JSON.parse(sent[0].init.body as string);
     expect(body).toMatchObject({ action: "process", context: { runId: "tr-1" }, inputs: { runId: "tr-1", ownerEmail: "owner@team.test", reviewUrl: "https://app.qa-pilot.test/runs/tr-1", candidates: [{ id: "DEF-1-checkout-001", needsLook: false }] } });
-    expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "ok", detail: { taskId: "run_42", status: "completed" } }]);
+    expect(readTriageLog("tr-1")).toMatchObject([{ tool: "start_triage_agent", outcome: "ok", detail: { taskId: "run_42", status: "completed", draft: "Hi, qa-pilot found 1 likely bug: the coupon endpoint returned 500." } }]);
   });
 
   it("logs that the owner decides in the app when AgenticOrg is not configured", async () => {
@@ -137,5 +137,16 @@ describe("starting the AgenticOrg triage agent", () => {
     const fakeFetch = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
     await expect(triageHandoff(store, "x", { baseUrl: "https://a", apiKey: "k", agentId: "a" }, fakeFetch)("tr-1", defects)).rejects.toThrow(/500/);
     expect(readTriageLog("tr-1")).toMatchObject([{ outcome: "error" }]);
+  });
+});
+
+describe("draftFrom", () => {
+  it("reads the agent's message from the shapes AgenticOrg returns, and nothing from an empty answer", async () => {
+    const { draftFrom } = await import("../src/triage/agenticorg.js");
+    expect(draftFrom({ output: { raw_output: " hello " } })).toBe("hello");
+    expect(draftFrom({ output: "plain" })).toBe("plain");
+    expect(draftFrom({ result: { output: { message: "nested" } } })).toBe("nested");
+    expect(draftFrom({ status: "hitl_triggered" })).toBeNull();
+    expect(draftFrom({ output: { raw_output: "   " } })).toBeNull();
   });
 });

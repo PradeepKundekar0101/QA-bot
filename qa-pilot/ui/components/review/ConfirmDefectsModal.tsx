@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { Button, Icon, Spinner } from "@/components/ui";
-import { fileUrl, getDefects, submitVerdicts, type Defect, type DefectVerdict } from "@/lib/api";
+import { agentHandoff, fileUrl, getDefects, getTriageLog, submitVerdicts, type AgentHandoff, type Defect, type DefectVerdict } from "@/lib/api";
 import { artifactRel } from "@/lib/cases";
 import { useRun } from "@/lib/run-context";
 
@@ -12,6 +12,63 @@ const CHOICES: { value: Verdict; label: string; help: string }[] = [
   { value: "rejected", label: "Not a bug", help: "The app is right" },
   { value: "script", label: "Test is wrong", help: "Fix the test, not the app" },
 ];
+
+/** The agent runs after the gate opens and takes a few seconds; the sheet checks back for this long. */
+const AGENT_POLL_MS = 3000;
+const AGENT_POLL_TRIES = 40;
+
+/**
+ * What the AgenticOrg triage agent drafted for the owner. It has no way to rule or file -
+ * AgenticOrg runs only read-only tools from a custom agent - so its work arrives here as a
+ * message to send, and the rulings stay with the person below.
+ */
+function AgentPanel({ runId }: { runId: string }) {
+  const [handoff, setHandoff] = useState<AgentHandoff | null>(null);
+  const [waiting, setWaiting] = useState(true);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < AGENT_POLL_TRIES && !cancelled; i++) {
+        const found = agentHandoff(await getTriageLog(runId).catch(() => []));
+        if (found) { if (!cancelled) setHandoff(found); break; }
+        await new Promise((r) => setTimeout(r, AGENT_POLL_MS));
+      }
+      if (!cancelled) setWaiting(false);
+    })();
+    return () => { cancelled = true; };
+  }, [runId]);
+
+  if (handoff?.state === "off" || (!handoff && !waiting)) return null;
+  return (
+    <section className="rounded-box border border-line bg-inset p-4" aria-label="Triage agent">
+      <p className="flex items-center gap-2 text-[13px] font-medium tracking-[0.2px] text-fg">
+        <Icon name="sparkles" size={13} className="text-info" /> Triage agent on AgenticOrg
+      </p>
+      {!handoff ? (
+        <p className="mt-2 flex items-center gap-2 text-[12.5px] text-muted"><Spinner /> Drafting a message to the run&apos;s owner</p>
+      ) : handoff.state === "held" ? (
+        <p className="mt-2 text-[12.5px] leading-relaxed text-muted">The agent&apos;s message is waiting for approval in AgenticOrg&apos;s approval queue.</p>
+      ) : handoff.state === "failed" ? (
+        <p className="mt-2 text-[12.5px] leading-relaxed text-fail">The agent could not draft a message: {handoff.reason}</p>
+      ) : (
+        <>
+          <p className="mt-2 whitespace-pre-wrap rounded-input border border-line bg-surface px-3 py-2 text-[13px] leading-relaxed text-body">{handoff.text}</p>
+          <div className="mt-2 flex items-center gap-3">
+            <Button
+              type="button" variant="outline" size="sm"
+              onClick={() => { void navigator.clipboard.writeText(handoff.text).then(() => setCopied(true)).catch(() => {}); }}
+            >
+              <Icon name={copied ? "check" : "clipboard"} size={12} /> {copied ? "Copied" : "Copy message"}
+            </Button>
+            <span className="text-[12px] text-subtle">Send it to whoever owns the app; their answers go in below.</span>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
 
 const SEVERITY: Record<Defect["severity"], string> = {
   critical: "bg-defect/12 text-defect", high: "bg-defect/12 text-defect", medium: "bg-flaky/12 text-flaky", low: "bg-inset text-env",
@@ -77,6 +134,7 @@ export function ConfirmDefectsModal() {
         </header>
 
         <div className="min-h-0 flex-1 space-y-3 overflow-auto p-4">
+          {!loadError && <AgentPanel runId={runId} />}
           {loadError ? (
             <p role="alert" className="flex items-center gap-2 p-6 text-[13px] text-fail"><Icon name="alert" size={14} /> {loadError}</p>
           ) : defects === null ? (

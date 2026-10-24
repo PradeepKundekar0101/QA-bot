@@ -171,3 +171,15 @@ describe("classificationLabel", () => {
     expect(classificationLabel({ test: "a", class: "defect", confidence: 0.9, evidence: [], action: "escalate" })).toBe("defect");
   });
 });
+
+describe("agentHandoff", () => {
+  const entry = (outcome: "ok" | "refused" | "error", detail: unknown) => ({ at, tool: "start_triage_agent", input: {}, outcome, detail });
+  it("reads the agent's draft, a held run, a failure, or that the agent is off", async () => {
+    const { agentHandoff } = await import("@/lib/api");
+    expect(agentHandoff([])).toBeNull();
+    expect(agentHandoff([entry("ok", { status: "completed", draft: "Hi" })])).toEqual({ state: "draft", text: "Hi" });
+    expect(agentHandoff([entry("ok", { status: "hitl_triggered", draft: null })])).toEqual({ state: "held" });
+    expect(agentHandoff([entry("error", "AgenticOrg answered 500")])).toEqual({ state: "failed", reason: "AgenticOrg answered 500" });
+    expect(agentHandoff([entry("refused", "not configured")])).toEqual({ state: "off" });
+  });
+});
