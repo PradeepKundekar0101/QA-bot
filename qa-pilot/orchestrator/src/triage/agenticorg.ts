@@ -12,7 +12,8 @@ import { logTriage } from "./tools.js";
  * each candidate, records their ruling, and files what they confirmed, all through qa-pilot's
  * MCP tools; it never rules on its own.
  */
-export const AGENTICORG_DEFAULT_URL = "https://app.agenticorg.ai";
+/** The Airtribe x Pine Labs AI Builders Day deployment, which is where the triage agent lives. */
+export const AGENTICORG_DEFAULT_URL = "https://agenticorg.hackathon.pinelabs.com";
 
 export type AgenticOrgConfig = {
   baseUrl: string;
