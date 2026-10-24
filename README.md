@@ -1,10 +1,5 @@
 # PRD — Autonomous Test Orchestration Agent
 
-**Codename:** `qa-pilot` (rename freely)
-**Event:** Bessemer Tech Catalyst — Aivar Innovations, AI/ML track
-**Owner:** Pradeep
-**Status:** Build spec, v1
-
 ---
 
 ## 1. One-line summary
