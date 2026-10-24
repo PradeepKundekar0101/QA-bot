@@ -67,7 +67,10 @@ describe("triage agent MCP endpoint", () => {
   it("lists its tools", async () => {
     const app = createApi({ store, start: () => ({ runId: "x" }), trackers, agentToken: TOKEN });
     const { body } = await call(app, "tools/list", {});
-    expect(body.result.tools.map((t: { name: string }) => t.name).sort()).toEqual(["file_confirmed_defect", "list_candidate_defects", "log_owner_message", "record_owner_verdict", "rerun_tests"]);
+    const tools = body.result.tools as { name: string; annotations?: { readOnlyHint?: boolean } }[];
+    expect(tools.map((t) => t.name).sort()).toEqual(["file_confirmed_defect", "list_candidate_defects", "log_owner_message", "record_owner_verdict", "rerun_tests"]);
+    // Only listing is read-only; everything that records, files or reruns needs an approval on the agent platform.
+    expect(tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name)).toEqual(["list_candidate_defects"]);
   });
 
   it("files nothing until the owner confirms, then files once, and logs every step", async () => {

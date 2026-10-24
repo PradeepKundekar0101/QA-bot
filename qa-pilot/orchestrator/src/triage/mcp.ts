@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import type { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
   FileDefectInput, ListCandidatesInput, LogMessageInput, RecordVerdictInput, RerunInput, TriageError,
@@ -18,8 +19,13 @@ export function triageServer(deps: TriageDeps): McpServer {
   const server = new McpServer({ name: "qa-pilot-triage", version: "1.0.0" });
 
   /** Every call lands in the run's triage log, refused ones included: the log is the proof of what the agent did. */
-  const tool = <S extends z.ZodObject<{ runId: z.ZodString }>>(name: string, description: string, schema: S, fn: (deps: TriageDeps, input: z.infer<S>) => Promise<unknown>) => {
-    server.registerTool(name, { description, inputSchema: schema.shape }, (async (input: z.infer<S>) => {
+  /**
+   * `annotations` tell the agent platform what a tool does to the world. AgenticOrg requires
+   * an approval before any tool not declared read-only, and refuses to mark one read-only that
+   * the server did not; only listing the candidates is.
+   */
+  const tool = <S extends z.ZodObject<{ runId: z.ZodString }>>(name: string, description: string, schema: S, annotations: ToolAnnotations, fn: (deps: TriageDeps, input: z.infer<S>) => Promise<unknown>) => {
+    server.registerTool(name, { description, inputSchema: schema.shape, annotations }, (async (input: z.infer<S>) => {
       try {
         const out = await fn(deps, input);
         logTriage(input.runId, { tool: name, input, outcome: "ok", detail: out });
@@ -35,19 +41,19 @@ export function triageServer(deps: TriageDeps): McpServer {
 
   tool("list_candidate_defects",
     "List a qa-pilot run's candidate defects with their evidence, the classifier's confidence and reasoning, the owner's ruling so far, and any filed ticket. Candidates with needsLook are low confidence and must be presented as 'needs a look'.",
-    ListCandidatesInput, listCandidates);
+    ListCandidatesInput, { readOnlyHint: true, openWorldHint: false }, listCandidates);
   tool("record_owner_verdict",
     "Record the run owner's own ruling on one candidate defect, exactly as they gave it: confirmed (a real bug), rejected (not a bug), or script (the test is wrong). Never call this without the owner's explicit answer.",
-    RecordVerdictInput, recordOwnerVerdict);
+    RecordVerdictInput, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }, recordOwnerVerdict);
   tool("file_confirmed_defect",
     "File a defect the owner confirmed in their connected tracker (Linear or Jira) with repro steps and evidence. Refused unless the owner confirmed it. Filing the same defect twice returns the existing ticket.",
-    FileDefectInput, fileConfirmedDefect);
+    FileDefectInput, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }, fileConfirmedDefect);
   tool("rerun_tests",
     "Rerun only the named tests of a run, to check whether a filed defect has been fixed.",
-    RerunInput, rerunAffected);
+    RerunInput, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }, rerunAffected);
   tool("log_owner_message",
     "Record a message sent to or received from the run owner (email, WhatsApp) in the run's triage log.",
-    LogMessageInput, logOwnerMessage);
+    LogMessageInput, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }, logOwnerMessage);
   return server;
 }
 
